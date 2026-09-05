@@ -1,0 +1,25 @@
+# 笔试题目 / 群通知文档：不要提交到仓库
+1.md
+2.md
+kGroup实习生笔试题-候选人版-2026-08-10.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Test / runtime artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
