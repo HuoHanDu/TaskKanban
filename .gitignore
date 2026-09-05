@@ -22,6 +22,9 @@ htmlcov/
 logs/
 *.log
 
+# Defense/prep internal docs (not for public repo)
+doc/
+
 # IDE / OS
 .vscode/
 .idea/
