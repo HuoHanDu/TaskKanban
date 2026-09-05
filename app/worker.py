@@ -91,6 +91,39 @@ def run_worker_once(worker_id: str, *, show_params: bool = True) -> bool:
         raise
 
 
+def main_loop_forever(
+    *,
+    worker_id: str,
+    interval: float = 1.0,
+    show_params: bool = True,
+    claim_lease_seconds: float = 300.0,
+    recover_claimed_interval: float = 30.0,
+) -> None:
+    """Worker 主循环：可被命令行 main 或 scripts/run_workers.py 复用。
+
+    每个调用方应处于独立进程；不要在多个线程/协程中共享同一个 worker 身份。
+    """
+    logger.info("worker=%s started", worker_id)
+    while True:
+        try:
+            # 定期回收超时未进入 running 的 claimed 任务，避免 worker 崩溃后任务卡死。
+            if recover_claimed_interval > 0:
+                recovered = recover_expired_claims(claim_lease_seconds)
+                if recovered:
+                    logger.info("worker=%s recovered %d expired claimed task(s)",
+                                worker_id, recovered)
+
+            handled = run_worker_once(worker_id, show_params=show_params)
+            if not handled:
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            logger.info("worker=%s stopped", worker_id)
+            break
+        except Exception:
+            logger.exception("worker=%s unexpected error", worker_id)
+            time.sleep(interval)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TaskKanban worker")
     parser.add_argument("--worker-id", default="worker-local", help="worker 标识")
@@ -121,25 +154,13 @@ def main() -> None:
     args = parser.parse_args()
     show_params = args.show_params and not args.hide_params
 
-    logger.info("worker=%s started", args.worker_id)
-    while True:
-        try:
-            # 定期回收超时未进入 running 的 claimed 任务，避免 worker 崩溃后任务卡死。
-            if args.recover_claimed_interval > 0:
-                recovered = recover_expired_claims(args.claim_lease_seconds)
-                if recovered:
-                    logger.info("worker=%s recovered %d expired claimed task(s)",
-                                args.worker_id, recovered)
-
-            handled = run_worker_once(args.worker_id, show_params=show_params)
-            if not handled:
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            logger.info("worker=%s stopped", args.worker_id)
-            break
-        except Exception:
-            logger.exception("worker=%s unexpected error", args.worker_id)
-            time.sleep(args.interval)
+    main_loop_forever(
+        worker_id=args.worker_id,
+        interval=args.interval,
+        show_params=show_params,
+        claim_lease_seconds=args.claim_lease_seconds,
+        recover_claimed_interval=args.recover_claimed_interval,
+    )
 
 
 if __name__ == "__main__":
