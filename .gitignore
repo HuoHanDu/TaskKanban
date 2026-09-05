@@ -3,6 +3,10 @@
 2.md
 kGroup实习生笔试题-候选人版-2026-08-10.md
 
+# Environment / secrets
+.env
+*.local
+
 # Python
 __pycache__/
 *.py[cod]
