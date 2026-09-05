@@ -98,9 +98,9 @@ def main() -> None:
     print("=" * 70)
     print(f"总轮数 {args.rounds}，总重复认领次数 = {total_duplicates}")
     if total_duplicates == 0:
-        print("结果：0 次重复认领，并发安全验证通过 ✅")
+        print("结果：0 次重复认领，并发安全验证通过 [OK]")
     else:
-        print("结果：存在重复认领 ❌")
+        print("结果：存在重复认领 [FAIL]")
 
 
 if __name__ == "__main__":
