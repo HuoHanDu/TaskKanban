@@ -100,8 +100,12 @@ async function reportStep(taskId) {
   const detailRes = await fetch(`/tasks/${taskId}`);
   if (!detailRes.ok) { alert('请先查看详情'); return; }
   const detail = await detailRes.json();
-  const target = (detail.steps || []).find(s => s.status === 'running') || (detail.steps || [])[0];
-  if (!target) { alert('没有可上报的 step'); return; }
+  const steps = detail.steps || [];
+  // 优先选还没有 done 的 Step：先找 pending，再找 running。
+  // 这样才能演示“第一次 inserted=true，后 4 次 duplicate”。
+  const target = steps.find(s => s.status === 'pending')
+    || steps.find(s => s.status === 'running');
+  if (!target) { alert('所有 Step 都已完成，无法演示首次插入'); return; }
 
   const stepIndex = target.step_index;
   const results = [];
