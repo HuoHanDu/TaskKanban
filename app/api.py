@@ -64,16 +64,58 @@ def claim_task(task_id: int):
 
 @app.post("/tasks/{task_id}/steps/{step_index}/report")
 def report_step(task_id: int, step_index: int, body: ReportBody):
-    """重复上报 Step 完成结果；验证幂等写入。"""
-    inserted = repository.write_step_log(
-        task_id, step_index, body.status, body.message or "api report"
-    )
+    """重复上报 Step 完成结果；验证幂等写入。
+
+    默认 worker_id 固定为 "api-report"，用于看板并发按钮演示。
+    该接口只接受任务处于 claimed/running 且由同一 worker_id 持有；
+    若任务不在执行中，返回 409，避免对已完成/未认领任务写入日志。
+    """
+    task = repository.get_task_with_steps(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    if task["status"] not in {"claimed", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task status is {task['status']}, report only allowed while claimed/running",
+        )
+
+    worker_id = body.worker_id or "api-report"
+    if task["claimed_by"] != worker_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"task is claimed by {task['claimed_by']!r}, not {worker_id!r}",
+        )
+
+    try:
+        outcome = repository.report_step_execution(
+            task_id,
+            step_index,
+            body.status,
+            worker_id,
+            message=body.message or "api report",
+            keep_success_on_conflict=True,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if outcome["ignored_duplicate"]:
+        message = "duplicate failure ignored; existing success preserved"
+    elif outcome["log_inserted"]:
+        message = "first write"
+    else:
+        message = "duplicate ignored (idempotent)"
+
     return {
         "task_id": task_id,
         "step_index": step_index,
         "status": body.status,
-        "inserted": inserted,
-        "message": "first write" if inserted else "duplicate ignored (idempotent)",
+        "inserted": outcome["log_inserted"],
+        "step_status": outcome["step_status"],
+        "task_status": outcome["task_status"],
+        "task_finished": outcome["task_finished"],
+        "ignored_duplicate": outcome["ignored_duplicate"],
+        "message": message,
     }
 
 

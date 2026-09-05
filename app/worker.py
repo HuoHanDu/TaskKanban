@@ -13,7 +13,7 @@ import time
 from app.executor import execute_step
 from app.params import apply_step, apply_group
 from app import repository
-from app.repository import recover_expired_claims, release_task
+from app.repository import complete_task_atomically, recover_expired_claims, release_task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,60 +41,37 @@ def run_worker_once(worker_id: str) -> bool:
     try:
         # 按顺序逐步执行，边执行边合并参数（粘性）
         current = apply_group(task["base_params"], task["group_override"])
+        results: list[dict] = []
         for step in task["steps"]:
-            if not repository.mark_step_status(
-                task["id"],
-                step["step_index"],
-                "running",
-                worker_id=worker_id,
-                started=True,
-            ):
-                logger.warning(
-                    "worker=%s no longer owns task=%s at step=%s, abort execution",
-                    worker_id,
-                    task["id"],
-                    step["step_index"],
-                )
-                return True
-
             current = apply_step(current, step["override"])
             result = execute_step(step, current)
-
-            # 写日志（幂等，重复上报不会覆盖）
-            repository.write_step_log(
-                task["id"],
-                step["step_index"],
-                "success" if result.success else "failure",
-                result.message,
+            results.append(
+                {
+                    "step_index": step["step_index"],
+                    "success": result.success,
+                    "message": result.message,
+                }
             )
 
-            if result.success:
-                repository.mark_step_status(
-                    task["id"],
-                    step["step_index"],
-                    "done",
-                    worker_id=worker_id,
-                    finished=True,
-                )
-            else:
-                repository.mark_step_status(
-                    task["id"],
-                    step["step_index"],
-                    "failed",
-                    worker_id=worker_id,
-                    finished=True,
-                )
-                repository.mark_task_failed(task["id"], worker_id)
-                logger.info("worker=%s task=%s failed at step=%s",
-                            worker_id, task["id"], step["step_index"])
-                return True
-
-        repository.mark_task_done(task["id"], worker_id)
-        logger.info("worker=%s task=%s done", worker_id, task["id"])
+        # 所有 Step 都模拟执行完成后，在单个事务内原子提交：
+        # 日志 + Step 状态 + 任务终态要么全部成功，要么全部回滚。
+        outcome = repository.complete_task_atomically(
+            task["id"],
+            worker_id,
+            results=results,
+        )
+        if outcome["task_status"] == "failed":
+            failed_step = next(
+                (r["step_index"] for r in results if not r["success"]), None
+            )
+            logger.info("worker=%s task=%s failed at step=%s",
+                        worker_id, task["id"], failed_step)
+        else:
+            logger.info("worker=%s task=%s done", worker_id, task["id"])
         return True
     except Exception:
         # 执行中出现未预期异常：主动释放任务，便于其他 worker 重新认领。
-        # 已经写入的成功日志不会被覆盖（幂等）。
+        # 若 complete_task_atomically 已部分提交，由于它整体回滚，不会留下中间态。
         logger.exception("worker=%s task=%s unexpected error; releasing task",
                          worker_id, task_id)
         repository.release_task(task_id, worker_id)
