@@ -86,8 +86,9 @@ async function claimTask(taskId) {
 }
 
 async function reportStep(taskId) {
-  // 对某个 running 任务当前第一个 running/done 的 step 触发 5 次并发上报
-  // 这里简化：由后端/看板不知道具体 step_index 时，先取任务详情。
+  // 并发触发 5 次重复完成上报，演示幂等写入。
+  // 看板手动认领使用 worker_id=manual-claim，因此上报也必须携带同一 worker_id；
+  // 否则 API 会按“非持有者上报”返回 403。
   const detailRes = await fetch(`/tasks/${taskId}`);
   if (!detailRes.ok) { alert('请先查看详情'); return; }
   const detail = await detailRes.json();
@@ -100,7 +101,11 @@ async function reportStep(taskId) {
     const res = await fetch(`/tasks/${taskId}/steps/${stepIndex}/report`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'success', message: `并发第${i + 1}次` }),
+      body: JSON.stringify({
+        status: 'success',
+        message: `并发第${i + 1}次`,
+        worker_id: 'manual-claim'
+      }),
     });
     results.push(await res.json());
   }
