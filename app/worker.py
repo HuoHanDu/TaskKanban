@@ -37,9 +37,19 @@ def run_worker_once(worker_id: str, *, show_params: bool = True) -> bool:
 
     # 只有真正从 claimed 推进到 running 成功，才继续执行。
     # 防止 worker 认领后任务已被其他调用方释放/回收/修改。
-    if not repository.mark_task_running(task_id, worker_id):
-        logger.warning("worker=%s lost ownership of task=%s before running",
+    # 若推进失败（死锁/失去持有权），主动释放任务回 pending，避免孤儿 claimed。
+    try:
+        running_ok = repository.mark_task_running(task_id, worker_id)
+    except Exception:
+        logger.exception("worker=%s failed to mark task=%s running; releasing task",
+                         worker_id, task_id)
+        repository.release_task(task_id, worker_id)
+        return True
+
+    if not running_ok:
+        logger.warning("worker=%s lost ownership of task=%s before running; releasing",
                        worker_id, task_id)
+        repository.release_task(task_id, worker_id)
         return True
 
     try:

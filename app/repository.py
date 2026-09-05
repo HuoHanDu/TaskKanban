@@ -484,32 +484,67 @@ def recover_expired_claims(max_claimed_seconds: float) -> int:
 # 单步状态更新（条件更新，返回是否实际变更）
 # ---------------------------------------------------------------
 
+# MySQL 死锁错误码：遇到 1213/40001 时通常可重试
+DEADLOCK_ERROR_CODES = {1213, 40001}
+# 死锁/锁等待重试次数
+MAX_LOCK_RETRIES = 3
+
+
+def _is_deadlock(exc: Exception) -> bool:
+    """判断异常是否为 MySQL 死锁或锁等待超时。"""
+    errno = getattr(exc, "errno", None)
+    if errno is not None:
+        return int(errno) in DEADLOCK_ERROR_CODES
+    # 部分驱动包装在 args 中
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, Exception):
+            nested = getattr(arg, "errno", None)
+            if nested is not None and int(nested) in DEADLOCK_ERROR_CODES:
+                return True
+        if isinstance(arg, (int, str)):
+            text = str(arg)
+            if "Deadlock" in text or "deadlock" in text:
+                return True
+    return False
+
+
 def mark_task_running(task_id: int, worker_id: str) -> bool:
     """将任务从 claimed 推进到 running。
 
     仅当任务当前状态为 claimed 且 claimed_by == worker_id 时成功。
+    遇到 MySQL 死锁自动重试最多 3 次。
     """
-    conn = create_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE tasks
-            SET status = 'running', started_at = COALESCE(started_at, NOW())
-            WHERE id = %s
-              AND status = 'claimed'
-              AND claimed_by = %s
-            """,
-            (task_id, worker_id),
-        )
-        success = cursor.rowcount == 1
-        conn.commit()
-        return success
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    last_exc: Exception | None = None
+    for attempt in range(MAX_LOCK_RETRIES):
+        conn = create_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET status = 'running', started_at = COALESCE(started_at, NOW())
+                WHERE id = %s
+                  AND status = 'claimed'
+                  AND claimed_by = %s
+                """,
+                (task_id, worker_id),
+            )
+            success = cursor.rowcount == 1
+            conn.commit()
+            return success
+        except Exception as exc:
+            conn.rollback()
+            last_exc = exc
+            if _is_deadlock(exc) and attempt + 1 < MAX_LOCK_RETRIES:
+                import time as _time
+                _time.sleep(0.05 * (attempt + 1))
+                continue
+            raise
+        finally:
+            conn.close()
+    # 理论上不会到这；如果重试耗尽则抛出最后一次异常
+    assert last_exc is not None
+    raise last_exc
 
 
 def mark_task_done(task_id: int, worker_id: str) -> bool:
