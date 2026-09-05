@@ -126,12 +126,22 @@ async function reportStep(taskId) {
 }
 
 async function showDetail(taskId) {
-  const res = await fetch(`/tasks/${taskId}`);
-  const data = await res.json();
-  const lines = data.steps.map(s =>
-    `Step${s.step_index} [${s.status}] action=${s.action} override=${JSON.stringify(s.override)}`
-  ).join('\n');
-  alert(`任务 ${taskId} 状态=${data.status}\n\n${lines}`);
+  const [taskRes, logsRes] = await Promise.all([
+    fetch(`/tasks/${taskId}`),
+    fetch(`/tasks/${taskId}/logs`),
+  ]);
+  if (!taskRes.ok) { alert('任务不存在'); return; }
+  const data = await taskRes.json();
+  const logsData = logsRes.ok ? await logsRes.json() : { logs: [] };
+  const logs = logsData.logs || [];
+
+  const stepLines = data.steps.map(s => {
+    const log = logs.find(l => l.step_index === s.step_index);
+    const paramText = log ? log.message : '(尚未执行)';
+    return `Step${s.step_index} [${s.status}]\n    ${paramText}`;
+  }).join('\n');
+
+  alert(`任务 ${taskId} 状态=${data.status}\n\n${stepLines}`);
 }
 
 // 定时刷新

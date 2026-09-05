@@ -49,6 +49,16 @@ def get_task_detail(task_id: int):
     return task
 
 
+@app.get("/tasks/{task_id}/logs")
+def get_task_logs(task_id: int):
+    """返回任务全部 Step 执行日志，用于看板/答辩展示参数演变。"""
+    task = repository.get_task_with_steps(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    logs = repository.list_step_logs(task_id)
+    return {"task_id": task_id, "logs": logs}
+
+
 @app.post("/tasks/{task_id}/claim")
 def claim_task(task_id: int):
     """按指定任务手动认领（演示/测试用；真实 worker 使用数据库原子认领）。"""

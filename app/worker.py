@@ -22,8 +22,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_worker_once(worker_id: str) -> bool:
-    """认领并执行一个任务；没有可执行任务时返回 False。"""
+def run_worker_once(worker_id: str, *, show_params: bool = True) -> bool:
+    """认领并执行一个任务；没有可执行任务时返回 False。
+
+    show_params=True 时每个 Step 执行前打印该 Step 看到的参数快照，
+    便于现场展示 L1/L2/L3 粘性合并过程。
+    """
     task = repository.claim_next_task(worker_id)
     if task is None:
         return False
@@ -44,6 +48,15 @@ def run_worker_once(worker_id: str) -> bool:
         results: list[dict] = []
         for step in task["steps"]:
             current = apply_step(current, step["override"])
+            if show_params:
+                logger.info(
+                    "worker=%s task=%s step=%s override=%s params=%s",
+                    worker_id,
+                    task_id,
+                    step["step_index"],
+                    step["override"],
+                    current,
+                )
             result = execute_step(step, current)
             results.append(
                 {
@@ -94,7 +107,19 @@ def main() -> None:
         default=30.0,
         help="worker 每次循环前执行超时 claimed 回收的间隔控制；<=0 表示关闭",
     )
+    parser.add_argument(
+        "--show-params",
+        action="store_true",
+        default=True,
+        help="每个 Step 执行时打印该 Step 看到的参数快照（默认开启）",
+    )
+    parser.add_argument(
+        "--hide-params",
+        action="store_true",
+        help="关闭 Step 参数打印，只保留任务级日志",
+    )
     args = parser.parse_args()
+    show_params = args.show_params and not args.hide_params
 
     logger.info("worker=%s started", args.worker_id)
     while True:
@@ -106,7 +131,7 @@ def main() -> None:
                     logger.info("worker=%s recovered %d expired claimed task(s)",
                                 args.worker_id, recovered)
 
-            handled = run_worker_once(args.worker_id)
+            handled = run_worker_once(args.worker_id, show_params=show_params)
             if not handled:
                 time.sleep(args.interval)
         except KeyboardInterrupt:
