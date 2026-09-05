@@ -70,6 +70,7 @@ function render(tasks) {
       <td>${task.created_at || '-'}</td>
       <td>
         ${task.status === 'pending' ? `<button class="btn btn-claim" onclick="claimTask(${task.id})">认领</button>` : ''}
+        ${task.status === 'claimed' ? `<button class="btn" style="background:#16a085;color:white" onclick="startTask(${task.id})">开始</button>` : ''}
         ${task.status === 'running' ? `<button class="btn btn-report" onclick="reportStep(${task.id})">并发幂等测试</button>` : ''}
         <button class="btn" style="background:#95a5a6;color:white" onclick="showDetail(${task.id})">详情</button>
       </td>
@@ -80,6 +81,13 @@ function render(tasks) {
 
 async function claimTask(taskId) {
   const res = await fetch(`/tasks/${taskId}/claim`, { method: 'POST' });
+  const data = await res.json();
+  alert(JSON.stringify(data));
+  refresh();
+}
+
+async function startTask(taskId) {
+  const res = await fetch(`/tasks/${taskId}/start`, { method: 'POST' });
   const data = await res.json();
   alert(JSON.stringify(data));
   refresh();

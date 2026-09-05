@@ -62,6 +62,29 @@ def claim_task(task_id: int):
     return {"claimed": claimed, "status": "claimed" if claimed else task["status"]}
 
 
+@app.post("/tasks/{task_id}/start")
+def start_task(task_id: int):
+    """手动把 manual-claim 认领的任务从 claimed 推进到 running（看板演示用）。"""
+    task = repository.get_task_with_steps(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task["status"] != "claimed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"task status is {task['status']}, start only allowed while claimed",
+        )
+    if task["claimed_by"] != "manual-claim":
+        raise HTTPException(
+            status_code=403,
+            detail="only tasks claimed by manual-claim can be started via API",
+        )
+
+    started = repository.mark_task_running(task_id, "manual-claim")
+    if not started:
+        raise HTTPException(status_code=409, detail="task could not be started")
+    return {"task_id": task_id, "status": "running", "started": True}
+
+
 @app.post("/tasks/{task_id}/steps/{step_index}/report")
 def report_step(task_id: int, step_index: int, body: ReportBody):
     """重复上报 Step 完成结果；验证幂等写入。
