@@ -108,11 +108,17 @@ def main() -> None:
             return f" AND {column} = %s", [args.status]
         if args.status == "active":
             return f" AND {column} IN ('pending','claimed','running')", []
+        # None：不额外加状态条件
         return "", []
 
-    # 1. active tasks
-    if args.status in {None, "active", "pending", "claimed", "running"}:
+    # 1. active tasks：默认只查真正 active，不查全部任务
+    active_scope = args.status in {None, "active", "pending", "claimed", "running"}
+    if active_scope:
         clause, params = _status_clause()
+        # 当默认模式时强制只查 active
+        if args.status is None:
+            clause = " AND t.status IN ('pending','claimed','running')"
+            params = []
         rows = _fetch_all(
             f"""
             SELECT t.id, t.status, t.claimed_by, t.claimed_at, t.created_at
