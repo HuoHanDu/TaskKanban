@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaskKanban 看板</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f7f8fa; }
+  h1 { font-size: 22px; }
+  table { border-collapse: collapse; width: 100%; background: white; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; font-size: 14px; }
+  th { background: #f0f2f5; }
+  .status { font-weight: bold; }
+  .status-pending { color: #888; }
+  .status-claimed { color: #e67e22; }
+  .status-running { color: #2980b9; }
+  .status-done { color: #27ae60; }
+  .status-failed { color: #e74c3c; }
+  .btn { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; }
+  .btn-report { background: #3498db; color: white; }
+  .btn-claim { background: #f39c12; color: white; }
+  .hint { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>任务状态看板</h1>
+<p class="hint">每 2 秒自动刷新</p>
+
+<table id="task-table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>状态</th>
+      <th>认领者</th>
+      <th>创建时间</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const STATUS_TEXT = {
+  pending: '待执行',
+  claimed: '已认领',
+  running: '执行中',
+  done: '完成',
+  failed: '失败',
+};
+
+async function refresh() {
+  try {
+    const res = await fetch('/tasks');
+    const data = await res.json();
+    render(data.tasks || []);
+  } catch (err) {
+    console.error('刷新失败', err);
+  }
+}
+
+function render(tasks) {
+  const tbody = document.querySelector('#task-table tbody');
+  tbody.innerHTML = '';
+  for (const task of tasks) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${task.id}</td>
+      <td class="status status-${task.status}">${STATUS_TEXT[task.status] || task.status}</td>
+      <td>${task.claimed_by || '-'}</td>
+      <td>${task.created_at || '-'}</td>
+      <td>
+        ${task.status === 'pending' ? `<button class="btn btn-claim" onclick="claimTask(${task.id})">认领</button>` : ''}
+        ${task.status === 'running' ? `<button class="btn btn-report" onclick="reportStep(${task.id})">并发幂等测试</button>` : ''}
+        <button class="btn" style="background:#95a5a6;color:white" onclick="showDetail(${task.id})">详情</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+async function claimTask(taskId) {
+  const res = await fetch(`/tasks/${taskId}/claim`, { method: 'POST' });
+  const data = await res.json();
+  alert(JSON.stringify(data));
+  refresh();
+}
+
+async function reportStep(taskId) {
+  // 对某个 running 任务当前第一个 running/done 的 step 触发 5 次并发上报
+  // 这里简化：由后端/看板不知道具体 step_index 时，先取任务详情。
+  const detailRes = await fetch(`/tasks/${taskId}`);
+  if (!detailRes.ok) { alert('请先查看详情'); return; }
+  const detail = await detailRes.json();
+  const target = (detail.steps || []).find(s => s.status === 'running') || (detail.steps || [])[0];
+  if (!target) { alert('没有可上报的 step'); return; }
+
+  const stepIndex = target.step_index;
+  const results = [];
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`/tasks/${taskId}/steps/${stepIndex}/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'success', message: `并发第${i + 1}次` }),
+    });
+    results.push(await res.json());
+  }
+  alert(JSON.stringify(results, null, 2));
+  refresh();
+}
+
+async function showDetail(taskId) {
+  const res = await fetch(`/tasks/${taskId}`);
+  const data = await res.json();
+  const lines = data.steps.map(s =>
+    `Step${s.step_index} [${s.status}] action=${s.action} override=${JSON.stringify(s.override)}`
+  ).join('\n');
+  alert(`任务 ${taskId} 状态=${data.status}\n\n${lines}`);
+}
+
+// 定时刷新
+setInterval(refresh, 2000);
+refresh();
+</script>
+</body>
+</html>

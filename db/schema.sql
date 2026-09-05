@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS steps (
     task_id    BIGINT UNSIGNED NOT NULL,
     step_index INT NOT NULL,
     override   JSON NOT NULL,
+    action     VARCHAR(64) NOT NULL DEFAULT 'mock',
     status     ENUM('pending','running','done','failed') NOT NULL DEFAULT 'pending',
     started_at DATETIME NULL,
     finished_at DATETIME NULL,
