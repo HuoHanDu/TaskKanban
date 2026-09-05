@@ -151,8 +151,48 @@ VALUES (...)
 | POST | `/tasks/{id}/claim` | 手动认领演示 |
 | POST | `/tasks/{id}/steps/{n}/report` | 重复完成上报（幂等演示） |
 
+## 状态机与持有权约束
+
+所有状态推进函数都使用条件更新，并返回 `bool`：
+
+- `claim`: `pending -> claimed`，同一任务只能被一个 worker 认领；
+- `mark_task_running(worker_id)`: 仅 `claimed_by == worker_id` 且状态为 `claimed` 时成功；
+- `mark_task_done/failed(worker_id)`: 仅当前持有者且状态为 `claimed/running` 时成功；
+- `mark_step_status(worker_id)`: 仅任务由该 worker 持有且处于 `claimed/running` 时成功；
+- `release_task(task_id, worker_id)`: 持有者主动释放，回到 `pending`；
+- `recover_expired_claims(max_claimed_seconds)`: 回收超过租约时间仍未进入 `running` 的 `claimed` 任务。
+
+### 合法状态流转
+
+```text
+pending --claim--> claimed --running--> running --done--> done
+                                \
+                                 \--failed--> failed
+```
+
+非法流转会被条件更新拒绝并返回 `False`：
+
+```text
+pending 直接 -> running/done/failed      拒绝
+claimed 被非持有者 -> running/done/failed 拒绝
+done -> failed/running/claimed           拒绝
+failed -> running/done                   拒绝
+```
+
+### Worker 参数
+
+```bash
+python -m app.worker --worker-id worker-1 \
+  --claim-lease-seconds 300 \
+  --recover-claimed-interval 30
+```
+
+- `--claim-lease-seconds`：claimed 任务超过该秒数未进入 running 则允许回收；
+- `--recover-claimed-interval`：worker 每次循环前执行过期 claimed 回收；`<=0` 关闭。
+
 ## 已知限制
 
 - Worker 的 Step 执行是 mock，不真正发送消息。
 - 未做用户认证（本地/笔试场景不需要）。
 - 未做 WebSocket，看板使用 2 秒轮询。
+- 超时回收只回收长期停留在 `claimed` 的任务；`running` 中 worker 真实崩溃仍需心跳/租约续期机制，当前属于简化方案。

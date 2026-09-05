@@ -59,7 +59,7 @@ def claim_task(task_id: int):
         raise HTTPException(status_code=409, detail=f"task status is {task['status']}")
 
     claimed = repository.claim_by_id(task_id, worker_id="manual-claim")
-    return {"claimed": claimed}
+    return {"claimed": claimed, "status": "claimed" if claimed else task["status"]}
 
 
 @app.post("/tasks/{task_id}/steps/{step_index}/report")
