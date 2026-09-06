@@ -14,7 +14,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from app.executor import execute_step
 from app.params import apply_step, apply_group
 from app import repository
-from app.repository import complete_task_atomically, recover_expired_claims, release_task
+from app.repository import (
+    complete_task_atomically,
+    recover_expired_claims,
+    recover_expired_running,
+    release_task,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,6 +237,10 @@ def main_loop_forever(
                     if recovered:
                         logger.info("worker=%s recovered %d expired claimed task(s)",
                                     worker_id, recovered)
+                    recovered_running = recover_expired_running(lease_seconds)
+                    if recovered_running:
+                        logger.info("worker=%s recovered %d expired running task(s)",
+                                    worker_id, recovered_running)
                     last_recover_time = time.monotonic()
 
             handled = run_worker_once(

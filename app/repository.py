@@ -646,7 +646,12 @@ def _recover_expired_claims_tx(conn: Any, max_claimed_seconds: float) -> int:
 
 @_retry_on_deadlock
 def _recover_expired_running_tx(conn: Any, lease_seconds: float) -> int:
-    """在单个连接内回收租约过期的 running 任务（不包含死锁重试）。"""
+    """在单个连接内回收租约已过期的 running 任务（不包含死锁重试）。
+
+    lease_seconds 参数保留兼容调用约定；实际过期判断以任务行的
+    lease_expires_at < NOW() 为准，因为 mark_task_running/renew 已经写入
+    “绝对到期时间”，不需要再额外扣一次秒数。
+    """
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -659,9 +664,8 @@ def _recover_expired_running_tx(conn: Any, lease_seconds: float) -> int:
             finished_at = NULL
         WHERE status = 'running'
           AND lease_expires_at IS NOT NULL
-          AND lease_expires_at < NOW() - INTERVAL %s SECOND
+          AND lease_expires_at < NOW()
         """,
-        (float(lease_seconds),),
     )
     recovered = cursor.rowcount
     conn.commit()
@@ -669,10 +673,11 @@ def _recover_expired_running_tx(conn: Any, lease_seconds: float) -> int:
 
 
 def recover_expired_running(lease_seconds: float = 30.0) -> int:
-    """把租约过期仍未续约的 running 任务重置回 pending。
+    """把租约已过期的 running 任务重置回 pending。
 
-    running 任务需要 worker 在 lease_seconds 内续约；超时说明 worker 可能
-    已崩溃。Steps 状态保留不动，重新执行时靠 step_logs 唯一键幂等去重。
+    running 任务需要 worker 在 lease_seconds 内续约；一旦 lease_expires_at
+    早于当前时间，说明 worker 未及时续约/可能崩溃。Steps 状态保留不动，
+    重新执行时靠 step_logs 唯一键幂等去重。
     遇到 MySQL 死锁自动重试最多 3 次。
     """
     return _recover_expired_running_tx(lease_seconds)
