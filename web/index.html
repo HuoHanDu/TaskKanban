@@ -95,11 +95,14 @@ async function startTask(taskId) {
 
 async function reportStep(taskId) {
   // 并发触发 5 次重复完成上报，演示幂等写入。
-  // 看板手动认领使用 worker_id=manual-claim，因此上报也必须携带同一 worker_id；
-  // 否则 API 会按“非持有者上报”返回 403。
+  // 先读任务详情，用 detail.claimed_by 作为上报所有权 worker_id，
+  // 不写死 manual-claim：真实 worker 认领的任务也能从看板按钮做并发演示。
   const detailRes = await fetch(`/tasks/${taskId}`);
   if (!detailRes.ok) { alert('请先查看详情'); return; }
   const detail = await detailRes.json();
+  const workerId = detail.claimed_by;
+  if (!workerId) { alert('任务尚未被认领，无法上报'); return; }
+
   const steps = detail.steps || [];
   // 优先选还没有 done 的 Step：先找 pending，再找 running。
   // 这样才能演示“第一次 inserted=true，后 4 次 duplicate”。
@@ -108,19 +111,18 @@ async function reportStep(taskId) {
   if (!target) { alert('所有 Step 都已完成，无法演示首次插入'); return; }
 
   const stepIndex = target.step_index;
-  const results = [];
-  for (let i = 0; i < 5; i++) {
-    const res = await fetch(`/tasks/${taskId}/steps/${stepIndex}/report`, {
+  const requests = Array.from({ length: 5 }, (_, i) =>
+    fetch(`/tasks/${taskId}/steps/${stepIndex}/report`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         status: 'success',
         message: `并发第${i + 1}次`,
-        worker_id: 'manual-claim'
+        worker_id: workerId
       }),
-    });
-    results.push(await res.json());
-  }
+    }).then(res => res.json())
+  );
+  const results = await Promise.all(requests);
   alert(JSON.stringify(results, null, 2));
   refresh();
 }

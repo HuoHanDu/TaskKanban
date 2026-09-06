@@ -49,6 +49,7 @@ def _worker_process_entry(
     show_params: bool,
     claim_lease_seconds: float,
     recover_claimed_interval: float,
+    fail_rate: float,
     log_path: str | None,
 ) -> None:
     """子进程入口：包装 worker 的主循环，方便 multiprocessing spawn。"""
@@ -70,6 +71,7 @@ def _worker_process_entry(
         show_params=show_params,
         claim_lease_seconds=claim_lease_seconds,
         recover_claimed_interval=recover_claimed_interval,
+        fail_rate=fail_rate,
     )
 
 
@@ -88,7 +90,13 @@ def main() -> None:
         "--recover-claimed-interval",
         type=float,
         default=30.0,
-        help="回收检查间隔秒；<=0 关闭",
+        help="超时 claimed 回收真实间隔秒；启动时先回收一次；<=0 关闭",
+    )
+    parser.add_argument(
+        "--fail-rate",
+        type=float,
+        default=0.0,
+        help="模拟 Step 失败概率（测试/演示用），默认 0 不失败",
     )
     parser.add_argument(
         "--show-params",
@@ -137,6 +145,7 @@ def main() -> None:
                 show_params,
                 args.claim_lease_seconds,
                 args.recover_claimed_interval,
+                args.fail_rate,
                 log_path,
             ),
         )

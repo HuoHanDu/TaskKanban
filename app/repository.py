@@ -42,6 +42,10 @@ DEADLOCK_RETRY_BASE_SLEEP = 0.05
 # 单次原子事务最多处理的步骤数，防御异常输入导致的超大事务。
 MAX_ATOMIC_STEPS = 1000
 
+# step_logs.message 使用 MySQL TEXT，最大 65535 字节；入库前显式校验，
+# 避免依赖 INSERT IGNORE / 非严格模式的静默截断。
+MAX_LOG_MESSAGE_BYTES = 65535
+
 
 # ---------------------------------------------------------------
 # 内部辅助
@@ -100,6 +104,26 @@ def _validate_status(status: str, allowed: set[str]) -> None:
     if status not in allowed:
         raise ValueError(
             f"invalid status {status!r}; expected one of {sorted(allowed)}"
+        )
+
+
+def _validate_log_message(message: Optional[str]) -> None:
+    """校验日志 message 不超过 MySQL TEXT 列可安全存储的长度。
+
+    message 为空/None 时合法。TEXT 最多 65535 字节；字符串编码使用 utf8mb4
+    时按 UTF-8 字节数计算，避免按字符数校验仍被 MySQL 截断。
+    """
+    if message is None:
+        return
+    if not isinstance(message, str):
+        raise TypeError(
+            f"log message must be a string or None, got {type(message).__name__}"
+        )
+    size = len(message.encode("utf-8", errors="strict"))
+    if size > MAX_LOG_MESSAGE_BYTES:
+        raise ValueError(
+            f"log message too long: {size} bytes > {MAX_LOG_MESSAGE_BYTES} "
+            f"(MySQL TEXT limit); refusing to insert/truncate"
         )
 
 
@@ -313,15 +337,21 @@ def _insert_step_log(
     """在当前连接/事务内幂等写入 Step 日志（不提交）。
 
     返回 True 表示首次插入，False 表示唯一键冲突被忽略。
+    只容忍 (task_id, step_index) 唯一键冲突；数据超长、非空约束等
+    其他错误会原样抛出，不静默吞掉。
     """
+    _validate_log_message(message)
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT IGNORE INTO step_logs (task_id, step_index, status, message)
+        INSERT INTO step_logs (task_id, step_index, status, message)
         VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE id = id
         """,
         (task_id, step_index, status, message),
     )
+    # 首次插入 rowcount=1；重复命中唯一键且无操作更新时 rowcount=0
+    # （部分 MySQL 驱动可能返回 0；这里只需区分 1 / 0）。
     return cursor.rowcount == 1
 
 
@@ -803,7 +833,9 @@ def mark_step_status(
 # 原子事务：一个 Step 的执行结果上报
 # ---------------------------------------------------------------
 
-def report_step_execution(
+@_retry_on_deadlock
+def _report_step_execution_tx(
+    conn: Any,
     task_id: int,
     step_index: int,
     status: str,
@@ -812,7 +844,7 @@ def report_step_execution(
     message: Optional[str] = None,
     keep_success_on_conflict: bool = True,
 ) -> Dict[str, Any]:
-    """原子地完成一个 Step 的“日志 + Step 状态 + 任务状态”推进。
+    """原子地完成一个 Step 的“日志 + Step 状态 + 任务状态”推进（事务体）。
 
     事务语义：
     1. 锁定任务行，确认当前任务由 worker_id 持有且状态为 claimed/running；
@@ -833,166 +865,185 @@ def report_step_execution(
       }
 
     若任务不存在/不持有/状态非法/Step 不存在，抛 RuntimeError 并回滚，
-    不产生任何部分写入。
+    不产生任何部分写入。遇到死锁时由装饰器新建连接重试整个事务。
 
     keep_success_on_conflict 语义：
     - 当该 Step 已有成功日志，而本次上报是 failure 时，若为 True，
       本次失败上报会被忽略，任务和 Step 维持原状态；
     - 满足题目硬性要求“后到的失败不能覆盖已有的成功记录”。
     """
-    _validate_status(status, {"success", "failure"})
+    conn.start_transaction()
+    task = _load_task_for_update(conn, task_id)
+    if task is None:
+        raise RuntimeError(f"task {task_id} not found")
 
-    conn: MySQLConnectionAbstract = create_connection()
-    try:
-        conn.start_transaction()
-        task = _load_task_for_update(conn, task_id)
-        if task is None:
-            raise RuntimeError(f"task {task_id} not found")
+    _require_owner(task, worker_id)
 
-        _require_owner(task, worker_id)
-
-        # 校验 Step 存在（在事务内查询，避免对不存在 Step 写入日志）
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT status, step_index
-            FROM steps
-            WHERE task_id = %s AND step_index = %s
-            FOR UPDATE
-            """,
-            (task_id, step_index),
-        )
-        step_row = cursor.fetchone()
-        if step_row is None:
-            raise RuntimeError(
-                f"step_index {step_index} not found in task {task_id}"
-            )
-
-        # 严格按 step_index 升序推进：若存在比当前 Step 更小且仍未完成的前置 Step，
-        # 拒绝本次上报。这样避免“先报 Step2 再报 Step1”绕过顺序语义。
-        cursor.execute(
-            """
-            SELECT step_index, status
-            FROM steps
-            WHERE task_id = %s
-            ORDER BY step_index
-            FOR UPDATE
-            """,
-            (task_id,),
-        )
-        all_step_rows = cursor.fetchall()
-        all_steps = {int(r["step_index"]): r["status"] for r in all_step_rows}
-        if step_index not in all_steps:
-            raise RuntimeError(
-                f"step_index {step_index} not found in task {task_id}"
-            )
-        before_incomplete = [
-            idx
-            for idx, st in all_steps.items()
-            if idx < step_index and st != "done"
-        ]
-        if before_incomplete:
-            raise RuntimeError(
-                f"step_index {step_index} cannot be reported before "
-                f"previous steps complete: {before_incomplete}"
-            )
-        # 对已 done 的 Step 再次 success 属于幂等路径，放行；
-        # 对已 done 的 Step 再次 failure 会在后面由 keep_success_on_conflict 忽略。
-        step_status = "done" if status == "success" else "failed"
-        was_done = all_steps[step_index] == "done"
-        log_inserted = _insert_step_log(
-            conn, task_id, step_index, status, message
+    # 校验 Step 存在（在事务内查询，避免对不存在 Step 写入日志）
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        """
+        SELECT status, step_index
+        FROM steps
+        WHERE task_id = %s AND step_index = %s
+        FOR UPDATE
+        """,
+        (task_id, step_index),
+    )
+    step_row = cursor.fetchone()
+    if step_row is None:
+        raise RuntimeError(
+            f"step_index {step_index} not found in task {task_id}"
         )
 
-        # 后到失败不能覆盖已有成功日志/状态：若该 Step 已存在成功日志，
-        # 本次 failure 上报在 keep_success_on_conflict=True 时整体忽略。
-        existing_success = status == "failure" and _step_has_success_log(
-            conn, task_id, step_index
+    # 严格按 step_index 升序推进：若存在比当前 Step 更小且仍未完成的前置 Step，
+    # 拒绝本次上报。这样避免“先报 Step2 再报 Step1”绕过顺序语义。
+    cursor.execute(
+        """
+        SELECT step_index, status
+        FROM steps
+        WHERE task_id = %s
+        ORDER BY step_index
+        FOR UPDATE
+        """,
+        (task_id,),
+    )
+    all_step_rows = cursor.fetchall()
+    all_steps = {int(r["step_index"]): r["status"] for r in all_step_rows}
+    if step_index not in all_steps:
+        raise RuntimeError(
+            f"step_index {step_index} not found in task {task_id}"
         )
-
-        if existing_success and keep_success_on_conflict:
-            # 不改 Step、不改任务，也不覆盖日志；事务内没有任何数据变更。
-            conn.commit()
-            return {
-                "task_id": task_id,
-                "step_index": step_index,
-                "step_status": all_steps[step_index],
-                "task_status": task["status"],
-                "log_inserted": False,
-                "task_finished": False,
-                "ignored_duplicate": True,
-            }
-        # 若本次上报的是已经 done 的 Step 且状态仍为 success，属于重复幂等，
-        # 保持任务原状态，不再重复推进。
-        if was_done and status == "success":
-            conn.commit()
-            return {
-                "task_id": task_id,
-                "step_index": step_index,
-                "step_status": all_steps[step_index],
-                "task_status": task["status"],
-                "log_inserted": False,
-                "task_finished": False,
-                "ignored_duplicate": False,
-            }
-
-        # 更新 Step 为 done/failed
-        step_updated = _update_step_status(
-            conn,
-            task_id,
-            step_index,
-            step_status,
-            finished=True,
+    before_incomplete = [
+        idx
+        for idx, st in all_steps.items()
+        if idx < step_index and st != "done"
+    ]
+    if before_incomplete:
+        raise RuntimeError(
+            f"step_index {step_index} cannot be reported before "
+            f"previous steps complete: {before_incomplete}"
         )
+    # 对已 done 的 Step 再次 success 属于幂等路径，放行；
+    # 对已 done 的 Step 再次 failure 会在后面由 keep_success_on_conflict 忽略。
+    step_status = "done" if status == "success" else "failed"
+    was_done = all_steps[step_index] == "done"
+    log_inserted = _insert_step_log(
+        conn, task_id, step_index, status, message
+    )
 
-        # 判断任务是否结束：失败即结束；成功且是最后一个 Step 则 done。
-        task_finished = False
-        if status == "failure":
-            task_status = "failed"
-            _update_task_status(conn, task_id, "failed", finished=True)
-            task_finished = True
-        else:
-            total = len(all_steps)
-            # 基于事务开始时锁定的 Step 状态计算：只有本次真正从非 done 变成 done
-            # 才增加 done 计数；重复上报已 done Step 不会让任务误判为全部完成。
-            done_count = sum(1 for st in all_steps.values() if st == "done")
-            if step_updated and step_status == "done" and not was_done:
-                done_count += 1
-            if total == done_count:
-                task_status = "done"
-                _update_task_status(conn, task_id, "done", finished=True)
-                task_finished = True
-            else:
-                task_status = task["status"]  # 保持 running/claimed
+    # 后到失败不能覆盖已有成功日志/状态：若该 Step 已存在成功日志，
+    # 本次 failure 上报在 keep_success_on_conflict=True 时整体忽略。
+    existing_success = status == "failure" and _step_has_success_log(
+        conn, task_id, step_index
+    )
 
+    if existing_success and keep_success_on_conflict:
+        # 不改 Step、不改任务，也不覆盖日志；事务内没有任何数据变更。
         conn.commit()
         return {
             "task_id": task_id,
             "step_index": step_index,
-            "step_status": step_status,
-            "task_status": task_status,
-            "log_inserted": log_inserted,
-            "task_finished": task_finished,
+            "step_status": all_steps[step_index],
+            "task_status": task["status"],
+            "log_inserted": False,
+            "task_finished": False,
+            "ignored_duplicate": True,
+        }
+    # 若本次上报的是已经 done 的 Step 且状态仍为 success，属于重复幂等，
+    # 保持任务原状态，不再重复推进。
+    if was_done and status == "success":
+        conn.commit()
+        return {
+            "task_id": task_id,
+            "step_index": step_index,
+            "step_status": all_steps[step_index],
+            "task_status": task["status"],
+            "log_inserted": False,
+            "task_finished": False,
             "ignored_duplicate": False,
         }
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+
+    # 更新 Step 为 done/failed
+    step_updated = _update_step_status(
+        conn,
+        task_id,
+        step_index,
+        step_status,
+        finished=True,
+    )
+
+    # 判断任务是否结束：失败即结束；成功且是最后一个 Step 则 done。
+    task_finished = False
+    if status == "failure":
+        task_status = "failed"
+        _update_task_status(conn, task_id, "failed", finished=True)
+        task_finished = True
+    else:
+        total = len(all_steps)
+        # 基于事务开始时锁定的 Step 状态计算：只有本次真正从非 done 变成 done
+        # 才增加 done 计数；重复上报已 done Step 不会让任务误判为全部完成。
+        done_count = sum(1 for st in all_steps.values() if st == "done")
+        if step_updated and step_status == "done" and not was_done:
+            done_count += 1
+        if total == done_count:
+            task_status = "done"
+            _update_task_status(conn, task_id, "done", finished=True)
+            task_finished = True
+        else:
+            task_status = task["status"]  # 保持 running/claimed
+
+    conn.commit()
+    return {
+        "task_id": task_id,
+        "step_index": step_index,
+        "step_status": step_status,
+        "task_status": task_status,
+        "log_inserted": log_inserted,
+        "task_finished": task_finished,
+        "ignored_duplicate": False,
+    }
 
 
-def complete_task_atomically(
+def report_step_execution(
+    task_id: int,
+    step_index: int,
+    status: str,
+    worker_id: str,
+    *,
+    message: Optional[str] = None,
+    keep_success_on_conflict: bool = True,
+) -> Dict[str, Any]:
+    """原子地完成一个 Step 的“日志 + Step 状态 + 任务状态”推进。
+
+    这是对 _report_step_execution_tx 的公开入口：每次调用新建连接，
+    遇到 MySQL 死锁 1213/40001 时自动重跑整个事务，最多 3 次。
+    """
+    _validate_status(status, {"success", "failure"})
+    return _report_step_execution_tx(
+        task_id,
+        step_index,
+        status,
+        worker_id,
+        message=message,
+        keep_success_on_conflict=keep_success_on_conflict,
+    )
+
+
+@_retry_on_deadlock
+def _complete_task_atomically_tx(
+    conn: Any,
     task_id: int,
     worker_id: str,
     *,
     results: Sequence[Mapping[str, Any]],
     keep_success_on_conflict: bool = True,
 ) -> Dict[str, Any]:
-    """在单个事务内批量提交一个任务的全部 Step 执行结果。
+    """在单个事务内批量提交一个任务的全部 Step 执行结果（事务体）。
 
     这是 run_worker_once 的原子版本：所有 Step 日志、Step 状态、任务终态
     要么全部生效，要么全部回滚，避免执行中断产生部分状态。
+    遇到死锁时由装饰器新建连接重试整个事务。
 
     results 元素格式：
       {"step_index": int, "success": bool, "message": str = "", ...}
@@ -1013,6 +1064,127 @@ def complete_task_atomically(
     为 True 时该失败结果被忽略（不改变 Step/任务状态），满足
     “后到失败不能覆盖已有成功”的硬性要求。
     """
+    conn.start_transaction()
+    task = _load_task_for_update(conn, task_id)
+    if task is None:
+        raise RuntimeError(f"task {task_id} not found")
+    _require_owner(task, worker_id)
+
+    # 校验所有 step_index 都存在且没有重复；同时锁定步骤行。
+    indexes = [int(item["step_index"]) for item in results]
+    if len(set(indexes)) != len(indexes):
+        raise ValueError(f"duplicate step_index in results: {indexes}")
+
+    cursor = conn.cursor(dictionary=True)
+    sql_placeholders = ", ".join(["%s"] * len(indexes))
+    cursor.execute(
+        f"""
+        SELECT step_index
+        FROM steps
+        WHERE task_id = %s AND step_index IN ({sql_placeholders})
+        FOR UPDATE
+        """,
+        [task_id, *indexes],
+    )
+    existing = {int(row["step_index"]) for row in cursor.fetchall()}
+    missing = set(indexes) - existing
+    if missing:
+        raise RuntimeError(
+            f"step_index not found in task {task_id}: {sorted(missing)}"
+        )
+
+    # 校验提交结果覆盖任务的全部 Step；不允许“只提交部分 Step 就把任务 done”。
+    # 先锁全部 Step 行，避免提交过程中任务 Steps 被并发修改。
+    cursor.execute(
+        """
+        SELECT step_index
+        FROM steps
+        WHERE task_id = %s
+        ORDER BY step_index
+        FOR UPDATE
+        """,
+        (task_id,),
+    )
+    all_steps = [int(row["step_index"]) for row in cursor.fetchall()]
+    if len(all_steps) != len(existing) or set(all_steps) != set(indexes):
+        raise RuntimeError(
+            f"results must cover every step of task {task_id}; "
+            f"task steps={all_steps}, result steps={sorted(indexes)}"
+        )
+
+    log_inserted = 0
+    ignored_failures = 0
+    effective_results: List[Mapping[str, Any]] = []
+    for item in results:
+        step_index = int(item["step_index"])
+        success = bool(item["success"])
+        message = item.get("message") or ""
+        step_status = "done" if success else "failed"
+
+        if not success and keep_success_on_conflict:
+            # 已有成功日志时忽略本次失败结果
+            if _step_has_success_log(conn, task_id, step_index):
+                ignored_failures += 1
+                continue
+
+        if _insert_step_log(
+            conn, task_id, step_index,
+            "success" if success else "failure",
+            message,
+        ):
+            log_inserted += 1
+        _update_step_status(
+            conn,
+            task_id,
+            step_index,
+            step_status,
+            started=True,
+            finished=True,
+        )
+        effective_results.append(item)
+
+    any_failed = any(not bool(item["success"]) for item in effective_results)
+    if effective_results and any_failed:
+        task_status = "failed"
+        _update_task_status(conn, task_id, "failed", finished=True)
+    elif effective_results:
+        task_status = "done"
+        _update_task_status(conn, task_id, "done", finished=True)
+    else:
+        # effective_results 为空且 ignored_failures > 0：
+        # 全部失败结果都因“已有 success 日志”被忽略，不应把任务错误置为 done。
+        # 这里不修改任务状态，保留 running/claimed；调用方会收到非终态结果。
+        if ignored_failures <= 0:
+            raise RuntimeError(
+                f"complete_task_atomically task {task_id}: no effective step "
+                f"results and no ignored failures; refusing to update task"
+            )
+        task_status = task["status"]
+
+    conn.commit()
+    return {
+        "task_id": task_id,
+        "task_status": task_status,
+        "log_inserted": log_inserted,
+        "steps_updated": len(effective_results),
+        "ignored_failures": ignored_failures,
+    }
+
+
+def complete_task_atomically(
+    task_id: int,
+    worker_id: str,
+    *,
+    results: Sequence[Mapping[str, Any]],
+    keep_success_on_conflict: bool = True,
+) -> Dict[str, Any]:
+    """在单个事务内批量提交一个任务的全部 Step 执行结果。
+
+    这是 run_worker_once 的原子版本：所有 Step 日志、Step 状态、任务终态
+    要么全部生效，要么全部回滚，避免执行中断产生部分状态。
+    每次调用新建连接；遇到 MySQL 死锁 1213/40001 时自动重跑整个事务，
+    最多 3 次。
+    """
     if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
         raise TypeError(
             f"results must be a sequence, got {type(results).__name__}"
@@ -1024,108 +1196,12 @@ def complete_task_atomically(
     if len(results) == 0:
         raise ValueError("results must not be empty when completing a task")
 
-    conn: MySQLConnectionAbstract = create_connection()
-    try:
-        conn.start_transaction()
-        task = _load_task_for_update(conn, task_id)
-        if task is None:
-            raise RuntimeError(f"task {task_id} not found")
-        _require_owner(task, worker_id)
-
-        # 校验所有 step_index 都存在且没有重复；同时锁定步骤行。
-        indexes = [int(item["step_index"]) for item in results]
-        if len(set(indexes)) != len(indexes):
-            raise ValueError(f"duplicate step_index in results: {indexes}")
-
-        cursor = conn.cursor(dictionary=True)
-        sql_placeholders = ", ".join(["%s"] * len(indexes))
-        cursor.execute(
-            f"""
-            SELECT step_index
-            FROM steps
-            WHERE task_id = %s AND step_index IN ({sql_placeholders})
-            FOR UPDATE
-            """,
-            [task_id, *indexes],
-        )
-        existing = {int(row["step_index"]) for row in cursor.fetchall()}
-        missing = set(indexes) - existing
-        if missing:
-            raise RuntimeError(
-                f"step_index not found in task {task_id}: {sorted(missing)}"
-            )
-
-        # 校验提交结果覆盖任务的全部 Step；不允许“只提交部分 Step 就把任务 done”。
-        # 先锁全部 Step 行，避免提交过程中任务 Steps 被并发修改。
-        cursor.execute(
-            """
-            SELECT step_index
-            FROM steps
-            WHERE task_id = %s
-            ORDER BY step_index
-            FOR UPDATE
-            """,
-            (task_id,),
-        )
-        all_steps = [int(row["step_index"]) for row in cursor.fetchall()]
-        if len(all_steps) != len(existing) or set(all_steps) != set(indexes):
-            raise RuntimeError(
-                f"results must cover every step of task {task_id}; "
-                f"task steps={all_steps}, result steps={sorted(indexes)}"
-            )
-
-        log_inserted = 0
-        ignored_failures = 0
-        effective_results: List[Mapping[str, Any]] = []
-        for item in results:
-            step_index = int(item["step_index"])
-            success = bool(item["success"])
-            message = item.get("message") or ""
-            step_status = "done" if success else "failed"
-
-            if not success and keep_success_on_conflict:
-                # 已有成功日志时忽略本次失败结果
-                if _step_has_success_log(conn, task_id, step_index):
-                    ignored_failures += 1
-                    continue
-
-            if _insert_step_log(
-                conn, task_id, step_index,
-                "success" if success else "failure",
-                message,
-            ):
-                log_inserted += 1
-            _update_step_status(
-                conn,
-                task_id,
-                step_index,
-                step_status,
-                started=True,
-                finished=True,
-            )
-            effective_results.append(item)
-
-        any_failed = any(not bool(item["success"]) for item in effective_results)
-        if any_failed:
-            task_status = "failed"
-            _update_task_status(conn, task_id, "failed", finished=True)
-        else:
-            task_status = "done"
-            _update_task_status(conn, task_id, "done", finished=True)
-
-        conn.commit()
-        return {
-            "task_id": task_id,
-            "task_status": task_status,
-            "log_inserted": log_inserted,
-            "steps_updated": len(effective_results),
-            "ignored_failures": ignored_failures,
-        }
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return _complete_task_atomically_tx(
+        task_id,
+        worker_id,
+        results=results,
+        keep_success_on_conflict=keep_success_on_conflict,
+    )
 
 
 # ---------------------------------------------------------------
@@ -1151,7 +1227,7 @@ def delete_task_by_id(task_id: int) -> None:
 def list_step_logs(task_id: int) -> List[Dict[str, Any]]:
     """返回某任务的全部步骤日志，按 step_index 升序。
 
-    遇到 MySQL 死锁自动重试最多 3 次。
+    只读查询，不开启可重试事务。
     """
     conn = create_connection()
     try:
@@ -1178,16 +1254,12 @@ def _write_step_log_tx(
     status: str,
     message: Optional[str],
 ) -> bool:
-    """在单个连接内幂等写入 Step 日志（不包含死锁重试）。"""
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT IGNORE INTO step_logs (task_id, step_index, status, message)
-        VALUES (%s, %s, %s, %s)
-        """,
-        (task_id, step_index, status, message),
-    )
-    inserted = cursor.rowcount == 1
+    """在单个连接内幂等写入 Step 日志（不包含死锁重试）。
+
+    与 _insert_step_log 一样只容忍唯一键冲突；超长等数据错误在
+    _insert_step_log 内已先显式校验并抛错。
+    """
+    inserted = _insert_step_log(conn, task_id, step_index, status, message)
     conn.commit()
     return inserted
 
@@ -1202,7 +1274,8 @@ def write_step_log(
 
     依赖 step_logs 表的 UNIQUE(task_id, step_index)：
     - 第一次写入成功返回 True。
-    - 重复写入被 INSERT IGNORE 忽略返回 False，且不会覆盖已有记录。
+    - 重复写入用 INSERT ... ON DUPLICATE KEY UPDATE id=id 容忍唯一键冲突，
+      返回 False 且不覆盖已有记录；超长等非唯一键错误不会被吞掉。
     - 遇到 MySQL 死锁自动重试最多 3 次。
     """
     _validate_status(status, LOG_STATUSES)

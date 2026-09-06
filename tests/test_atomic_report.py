@@ -119,6 +119,21 @@ def test_duplicate_report_does_not_overwrite_existing_success(task_id):
     assert task["steps"][0]["status"] == "done"
 
 
+def test_report_step_execution_rejects_too_long_message(task_id):
+    _claim(task_id)
+    _run(task_id)
+
+    with pytest.raises(ValueError, match="too long"):
+        repository.report_step_execution(
+            task_id, 1, "success", "worker-a", message="x" * 65536
+        )
+
+    # 事务整体回滚：无日志、Step 仍 pending
+    assert repository.list_step_logs(task_id) == []
+    task = repository.get_task_with_steps(task_id)
+    assert task["steps"][0]["status"] == "pending"
+
+
 def test_report_rejected_when_not_owner(task_id):
     _claim(task_id, "worker-a")
     _run(task_id)
@@ -224,3 +239,62 @@ def test_complete_task_atomically_rejects_non_owner(task_id):
             "worker-b",
             results=[{"step_index": 1, "success": True}],
         )
+
+
+def test_complete_task_atomically_rejects_too_long_message(task_id):
+    _claim(task_id)
+    _run(task_id)
+
+    with pytest.raises(ValueError, match="too long"):
+        repository.complete_task_atomically(
+            task_id,
+            "worker-a",
+            results=[
+                {"step_index": 1, "success": True, "message": "ok"},
+                {"step_index": 2, "success": True, "message": "x" * 65536},
+            ],
+        )
+
+    # 整体回滚：任务仍 running，两个 Step 都没有被标记 done/写入日志
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]
+    assert repository.list_step_logs(task_id) == []
+
+
+def test_complete_task_atomically_all_failures_ignored_does_not_mark_done(task_id):
+    """回归：全部结果都因已有 success 日志被忽略时，任务不能被错误置为 done。
+
+    场景：每个 Step 已通过 write_step_log 写了 success 日志，随后 worker
+    用 complete_task_atomically 上报全 failure；此时 effective_results 为空，
+    必须保留任务 running 状态且不覆盖已有日志。
+    """
+    _claim(task_id)
+    _run(task_id)
+
+    for idx in (1, 2):
+        assert repository.write_step_log(task_id, idx, "success", f"first-success-{idx}") is True
+
+    out = repository.complete_task_atomically(
+        task_id,
+        "worker-a",
+        results=[
+            {"step_index": 1, "success": False, "message": "late failure 1"},
+            {"step_index": 2, "success": False, "message": "late failure 2"},
+        ],
+        keep_success_on_conflict=True,
+    )
+
+    # 关键：不能把任务置为 done/failed；所有失败结果被忽略，状态仍为 running。
+    assert out["ignored_failures"] == 2
+    assert out["steps_updated"] == 0
+    assert out["task_status"] == "running"
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    # 已有 success 日志不能被覆盖，Step 状态也不能被回退成 failed
+    logs = repository.list_step_logs(task_id)
+    assert len(logs) == 2
+    assert all(log["status"] == "success" for log in logs)
+    assert {log["message"] for log in logs} == {"first-success-1", "first-success-2"}
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]

@@ -68,3 +68,48 @@ def test_concurrent_duplicate_reports_keep_one_log():
         assert sum(1 for r in results if r is False) == 4
     finally:
         repository.delete_task_by_id(tid)
+
+
+def test_message_too_long_is_rejected_not_truncated():
+    """超长 message 必须显式报错，不能被 INSERT IGNORE/MySQL 静默截断。"""
+    tid = repository.create_task(
+        base_params={},
+        group_override={},
+        steps=[{"step_index": 1, "override": {}, "action": "mock"}],
+    )
+    try:
+        too_long = "x" * 65536  # 超过 MySQL TEXT 的 65535 字节上限
+        with pytest.raises(ValueError, match="too long"):
+            repository.write_step_log(tid, 1, "success", too_long)
+
+        # 没有任何日志被写入（包括被截断的版本）
+        assert repository.list_step_logs(tid) == []
+
+        # 随后正常写入仍可工作
+        assert repository.write_step_log(tid, 1, "success", "normal") is True
+        logs = repository.list_step_logs(tid)
+        assert len(logs) == 1
+        assert logs[0]["message"] == "normal"
+    finally:
+        repository.delete_task_by_id(tid)
+
+
+def test_duplicate_with_on_duplicate_key_still_keeps_single_log():
+    """INSERT ... ON DUPLICATE KEY UPDATE id=id 仍保持只写一次的语义。"""
+    tid = repository.create_task(
+        base_params={},
+        group_override={},
+        steps=[{"step_index": 1, "override": {}, "action": "mock"}],
+    )
+    try:
+        first = repository.write_step_log(tid, 1, "failure", "boom")
+        second = repository.write_step_log(tid, 1, "success", "late success")
+
+        assert first is True
+        assert second is False
+        logs = repository.list_step_logs(tid)
+        assert len(logs) == 1
+        assert logs[0]["status"] == "failure"
+        assert logs[0]["message"] == "boom"
+    finally:
+        repository.delete_task_by_id(tid)
