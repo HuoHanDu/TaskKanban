@@ -66,6 +66,32 @@ def test_failure_path_pending_claimed_running_failed(task_id):
     assert _task_status(task_id) == "failed"
 
 
+def test_terminal_done_clears_running_lease(task_id):
+    _claim(task_id, "worker-a")
+    assert repository.mark_task_running(task_id, "worker-a", lease_seconds=30) is True
+    task = repository.get_task_with_steps(task_id)
+    assert task["lease_expires_at"] is not None
+
+    assert repository.mark_task_done(task_id, "worker-a") is True
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "done"
+    assert task["lease_expires_at"] is None
+
+
+def test_terminal_failed_clears_running_lease(task_id):
+    _claim(task_id, "worker-a")
+    assert repository.mark_task_running(task_id, "worker-a", lease_seconds=30) is True
+    task = repository.get_task_with_steps(task_id)
+    assert task["lease_expires_at"] is not None
+
+    assert repository.mark_task_failed(task_id, "worker-a") is True
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "failed"
+    assert task["lease_expires_at"] is None
+
+
 # ---------------------------------------------------------------
 # 非法状态迁移：必须返回 False 且状态不变
 # ---------------------------------------------------------------

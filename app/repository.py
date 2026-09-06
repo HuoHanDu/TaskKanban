@@ -282,13 +282,18 @@ def _update_task_status(
     started: bool = False,
     finished: bool = False,
 ) -> None:
-    """在当前连接/事务内更新任务状态（不提交，由调用方控制）。"""
+    """在当前连接/事务内更新任务状态（不提交，由调用方控制）。
+
+    进入终态（done/failed）时同时清空 running 租约，避免残留过期时间。
+    """
     assignments = ["status = %s"]
     params: list[Any] = [status]
     if started:
         assignments.append("started_at = COALESCE(started_at, NOW())")
     if finished:
         assignments.append("finished_at = NOW()")
+    if status in ("done", "failed"):
+        assignments.append("lease_expires_at = NULL")
     params.append(task_id)
     cursor = conn.cursor()
     cursor.execute(
@@ -704,11 +709,16 @@ def _mark_task_status(
     status: str,
     finished: bool,
 ) -> bool:
-    """在已创建的连接内推进任务状态；只允许当前持有者从活动状态到终态/运行态。"""
+    """在已创建的连接内推进任务状态；只允许当前持有者从活动状态到终态/运行态。
+
+    进入 done/failed 时清空 running 租约，避免残留过期时间。
+    """
     assignments = ["status = %s"]
     params: list[Any] = [status]
     if finished:
         assignments.append("finished_at = NOW()")
+    if status in ("done", "failed"):
+        assignments.append("lease_expires_at = NULL")
     params.extend([task_id, worker_id])
     cursor = conn.cursor()
     cursor.execute(
