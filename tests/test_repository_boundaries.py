@@ -78,6 +78,112 @@ def test_complete_task_atomically_rejects_empty_results(task_id):
         )
 
 
+@pytest.mark.parametrize(
+    "bad_index",
+    [1.5, True, 0, -1],
+)
+def test_complete_task_atomically_rejects_invalid_step_index(task_id, bad_index):
+    _claim_and_run(task_id)
+
+    with pytest.raises((TypeError, ValueError)):
+        repository.complete_task_atomically(
+            task_id,
+            "worker-a",
+            results=[
+                {"step_index": bad_index, "success": True},
+                {"step_index": 2, "success": True},
+            ],
+        )
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]
+    assert repository.list_step_logs(task_id) == []
+
+
+@pytest.mark.parametrize(
+    "bad_success",
+    ["false", 1, None],
+)
+def test_complete_task_atomically_rejects_invalid_success(task_id, bad_success):
+    _claim_and_run(task_id)
+
+    with pytest.raises(TypeError, match="success must be a bool"):
+        repository.complete_task_atomically(
+            task_id,
+            "worker-a",
+            results=[
+                {"step_index": 1, "success": bad_success},
+                {"step_index": 2, "success": True},
+            ],
+        )
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]
+    assert repository.list_step_logs(task_id) == []
+
+
+def test_complete_task_atomically_rejects_invalid_message_type(task_id):
+    _claim_and_run(task_id)
+
+    with pytest.raises(TypeError, match="log message must be a string"):
+        repository.complete_task_atomically(
+            task_id,
+            "worker-a",
+            results=[
+                {"step_index": 1, "success": True, "message": 123},
+                {"step_index": 2, "success": True},
+            ],
+        )
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]
+    assert repository.list_step_logs(task_id) == []
+
+
+def test_complete_task_atomically_rejects_non_mapping_result(task_id):
+    _claim_and_run(task_id)
+
+    with pytest.raises(TypeError, match="must be a mapping"):
+        repository.complete_task_atomically(
+            task_id,
+            "worker-a",
+            results=["not-a-mapping"],
+        )
+
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert [s["status"] for s in task["steps"]] == ["pending", "pending"]
+    assert repository.list_step_logs(task_id) == []
+
+
+def test_claim_next_task_releases_when_detail_read_fails(monkeypatch):
+    """认领 commit 后读详情失败，必须主动 release 回 pending，不能产生孤儿。"""
+    tid = repository.create_task(
+        base_params={},
+        group_override={},
+        steps=[{"step_index": 1, "override": {}, "action": "mock"}],
+    )
+    real_get = repository.get_task_with_steps
+    try:
+        def boom(task_id):
+            raise RuntimeError("detail read connection lost")
+
+        monkeypatch.setattr(repository, "get_task_with_steps", boom)
+
+        result = repository.claim_next_task("worker-a")
+        assert result is None
+
+        # 绕过 monkeypatch 用原始查询确认任务被释放
+        task = real_get(tid)
+        assert task["status"] == "pending"
+        assert task["claimed_by"] is None
+    finally:
+        repository.delete_task_by_id(tid)
+
+
 # ---------------------------------------------------------------
 # report_step_execution 顺序上报
 # ---------------------------------------------------------------

@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.worker import main_loop_forever  # noqa: E402
+from app.worker import main_loop_forever, validate_fail_rate  # noqa: E402
 
 
 def _worker_process_entry(
@@ -50,6 +50,7 @@ def _worker_process_entry(
     claim_lease_seconds: float,
     recover_claimed_interval: float,
     fail_rate: float,
+    lease_seconds: float,
     log_path: str | None,
 ) -> None:
     """子进程入口：包装 worker 的主循环，方便 multiprocessing spawn。"""
@@ -72,6 +73,7 @@ def _worker_process_entry(
         claim_lease_seconds=claim_lease_seconds,
         recover_claimed_interval=recover_claimed_interval,
         fail_rate=fail_rate,
+        lease_seconds=lease_seconds,
     )
 
 
@@ -99,6 +101,12 @@ def main() -> None:
         help="模拟 Step 失败概率（测试/演示用），默认 0 不失败",
     )
     parser.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=30.0,
+        help="running 租约秒数；Worker 每个 Step 前续约（默认 30）",
+    )
+    parser.add_argument(
         "--show-params",
         action="store_true",
         default=True,
@@ -124,6 +132,11 @@ def main() -> None:
     if args.workers <= 0:
         parser.error("--workers must be positive")
 
+    try:
+        fail_rate = validate_fail_rate(args.fail_rate)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     show_params = args.show_params and not args.hide_params
     ctx = mp.get_context("spawn")
 
@@ -145,7 +158,8 @@ def main() -> None:
                 show_params,
                 args.claim_lease_seconds,
                 args.recover_claimed_interval,
-                args.fail_rate,
+                fail_rate,
+                args.lease_seconds,
                 log_path,
             ),
         )

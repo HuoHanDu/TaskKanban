@@ -104,11 +104,16 @@ async function reportStep(taskId) {
   if (!workerId) { alert('任务尚未被认领，无法上报'); return; }
 
   const steps = detail.steps || [];
-  // 优先选还没有 done 的 Step：先找 pending，再找 running。
-  // 这样才能演示“第一次 inserted=true，后 4 次 duplicate”。
-  const target = steps.find(s => s.status === 'pending')
-    || steps.find(s => s.status === 'running');
+  const notDone = steps.filter(s => s.status === 'pending' || s.status === 'running');
+  // 单 Step 任务：第一个请求成功后任务会直接 done，其余请求会 409，体验不好。
+  // 优先选“pending 且不是最后一步”的 Step，确保演示完任务仍 running。
+  const target = notDone.find(s => s.status === 'pending' && s.step_index !== steps.length)
+    || notDone[0];
   if (!target) { alert('所有 Step 都已完成，无法演示首次插入'); return; }
+  if (steps.length === 1) {
+    alert('单步任务并发演示会产生部分 409，建议使用多步任务。');
+    return;
+  }
 
   const stepIndex = target.step_index;
   const requests = Array.from({ length: 5 }, (_, i) =>

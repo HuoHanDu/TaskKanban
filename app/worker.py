@@ -23,6 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def validate_fail_rate(fail_rate: float) -> float:
+    """校验 fail_rate 必须在 [0, 1]，非法时抛出 ValueError。"""
+    value = float(fail_rate)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"fail_rate must be between 0.0 and 1.0, got {fail_rate!r}")
+    return value
+
+
 def _sort_steps(steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """按 step_index 升序返回步骤列表（防御 SQL/内存顺序变化）。
 
@@ -39,12 +47,14 @@ def _run_claimed_task(
     show_params: bool = True,
     fail_rate: float = 0.0,
     sleep_seconds: float = 0.1,
+    lease_seconds: float = 30.0,
 ) -> bool:
     """执行一个已由 worker_id 推进到 running 的任务。
 
     步骤按 step_index 升序执行；参数在步骤间保持粘性。
-    任一步失败后立即停止后续 Step 执行，并把尚未执行的 Step 按失败结果补齐，
-    最后仍通过 complete_task_atomically 提交任务全部 Step，保证原子终态。
+    每个 Step 执行前续约 running 租约；任一步失败后立即停止后续 Step 执行，
+    并把尚未执行的 Step 按失败结果补齐，最后通过 complete_task_atomically
+    提交任务全部 Step，保证原子终态。
     """
     task_id = task["id"]
     try:
@@ -54,6 +64,10 @@ def _run_claimed_task(
         failed_step: Optional[int] = None
 
         for step in steps:
+            # 执行 Step 前先续约；只有当前 running 持有者能续约成功。
+            repository.renew_running_lease(
+                task_id, worker_id, lease_seconds=lease_seconds
+            )
             current = apply_step(current, step["override"])
             if show_params:
                 logger.info(
@@ -136,12 +150,14 @@ def run_worker_once(
     show_params: bool = True,
     fail_rate: float = 0.0,
     sleep_seconds: float = 0.1,
+    lease_seconds: float = 30.0,
 ) -> bool:
     """认领并执行一个任务；没有可执行任务时返回 False。
 
     show_params=True 时每个 Step 执行前打印该 Step 看到的参数快照，
     便于现场展示 L1/L2/L3 粘性合并过程。
     fail_rate 用于测试/演示注入 Step 失败概率，默认 0 表示 Worker 从不失败。
+    lease_seconds 是 running 租约秒数，执行期间每个 Step 前续约。
     """
     task = repository.claim_next_task(worker_id)
     if task is None:
@@ -154,7 +170,9 @@ def run_worker_once(
     # 防止 worker 认领后任务已被其他调用方释放/回收/修改。
     # 若推进失败（死锁/失去持有权），主动释放任务回 pending，避免孤儿 claimed。
     try:
-        running_ok = repository.mark_task_running(task_id, worker_id)
+        running_ok = repository.mark_task_running(
+            task_id, worker_id, lease_seconds=lease_seconds
+        )
     except Exception:
         logger.exception("worker=%s failed to mark task=%s running; releasing task",
                          worker_id, task_id)
@@ -173,6 +191,7 @@ def run_worker_once(
         show_params=show_params,
         fail_rate=fail_rate,
         sleep_seconds=sleep_seconds,
+        lease_seconds=lease_seconds,
     )
 
 
@@ -184,6 +203,7 @@ def main_loop_forever(
     claim_lease_seconds: float = 300.0,
     recover_claimed_interval: float = 30.0,
     fail_rate: float = 0.0,
+    lease_seconds: float = 30.0,
 ) -> None:
     """Worker 主循环：可被命令行 main 或 scripts/run_workers.py 复用。
 
@@ -192,6 +212,7 @@ def main_loop_forever(
     - 之后距离上次回收 elapsed >= recover_claimed_interval 才再次调用
       recover_expired_claims；
     - <=0 表示完全关闭回收。
+    lease_seconds 是 running 租约秒数，Worker 每个 Step 前续约。
     每个调用方应处于独立进程；不要在多个线程/协程中共享同一个 worker 身份。
     """
     logger.info("worker=%s started", worker_id)
@@ -205,8 +226,8 @@ def main_loop_forever(
                 if last_recover_time is None or (
                     now - last_recover_time >= recover_claimed_interval
                 ):
-                    logger.info("worker=%s recover claimed check (interval=%s)",
-                                worker_id, recover_claimed_interval)
+                    logger.debug("worker=%s recover claimed check (interval=%s)",
+                                 worker_id, recover_claimed_interval)
                     recovered = recover_expired_claims(claim_lease_seconds)
                     if recovered:
                         logger.info("worker=%s recovered %d expired claimed task(s)",
@@ -218,6 +239,7 @@ def main_loop_forever(
                 show_params=show_params,
                 fail_rate=fail_rate,
                 sleep_seconds=0.1,
+                lease_seconds=lease_seconds,
             )
             if not handled:
                 time.sleep(interval)
@@ -252,6 +274,12 @@ def main() -> None:
         help="模拟 Step 失败概率（测试/演示用），默认 0 表示 Worker 不失败",
     )
     parser.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=30.0,
+        help="running 租约秒数；Worker 每个 Step 前续约（默认 30）",
+    )
+    parser.add_argument(
         "--show-params",
         action="store_true",
         default=True,
@@ -265,13 +293,19 @@ def main() -> None:
     args = parser.parse_args()
     show_params = args.show_params and not args.hide_params
 
+    try:
+        fail_rate = validate_fail_rate(args.fail_rate)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     main_loop_forever(
         worker_id=args.worker_id,
         interval=args.interval,
         show_params=show_params,
         claim_lease_seconds=args.claim_lease_seconds,
         recover_claimed_interval=args.recover_claimed_interval,
-        fail_rate=args.fail_rate,
+        fail_rate=fail_rate,
+        lease_seconds=args.lease_seconds,
     )
 
 

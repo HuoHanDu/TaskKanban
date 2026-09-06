@@ -242,6 +242,40 @@ def test_owner_can_release_running_task(task_id):
     assert _task_status(task_id) == "pending"
 
 
+def test_recover_expired_running_resets_stale_running(task_id):
+    _claim(task_id, "worker-a")
+    assert repository.mark_task_running(task_id, "worker-a") is True
+
+    conn = repository.create_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE tasks SET lease_expires_at = NOW() - INTERVAL 9999 SECOND "
+            "WHERE id = %s",
+            (task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    recovered = repository.recover_expired_running(lease_seconds=60)
+    assert recovered >= 1
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "pending"
+    assert task["claimed_by"] is None
+    assert task["started_at"] is None
+    assert task["lease_expires_at"] is None
+
+
+def test_recover_expired_running_does_not_reset_active_lease(task_id):
+    _claim(task_id, "worker-a")
+    assert repository.mark_task_running(task_id, "worker-a") is True
+
+    recovered = repository.recover_expired_running(lease_seconds=60)
+    assert recovered == 0
+    assert _task_status(task_id) == "running"
+
+
 # ---------------------------------------------------------------
 # API 手动认领的幂等性（仓库层语义）
 # ---------------------------------------------------------------

@@ -12,7 +12,12 @@ import pytest
 
 from app import repository
 from app.executor import StepResult
-from app.worker import _run_claimed_task, main_loop_forever, run_worker_once
+from app.worker import (
+    _run_claimed_task,
+    main_loop_forever,
+    run_worker_once,
+    validate_fail_rate,
+)
 
 
 @pytest.fixture()
@@ -206,3 +211,14 @@ def test_recover_claimed_interval_zero_disables_recovery():
 
     assert worker_calls[0] == 2
     assert recover_calls == []
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.1, 2.0])
+def test_validate_fail_rate_rejects_out_of_range(bad):
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        validate_fail_rate(bad)
+
+
+def test_validate_fail_rate_accepts_bounds():
+    assert validate_fail_rate(0.0) == 0.0
+    assert validate_fail_rate(1.0) == 1.0

@@ -17,6 +17,7 @@ env/
 htmlcov/
 logs/
 *.log
+backups/
 
 # Defense/prep internal docs (not for public repo)
 doc/

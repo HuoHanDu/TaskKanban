@@ -240,3 +240,23 @@ def test_report_missing_task_returns_404():
         json={"status": "success", "worker_id": REPORT_WORKER},
     )
     assert resp.status_code == 404
+
+
+def test_report_too_long_message_returns_422_and_no_log(task_id):
+    _claim_and_run(task_id, MANUAL_WORKER)
+
+    resp = client.post(
+        f"/tasks/{task_id}/steps/1/report",
+        json={
+            "status": "success",
+            "message": "x" * 65536,
+            "worker_id": MANUAL_WORKER,
+        },
+    )
+    assert resp.status_code == 422
+    assert "too long" in resp.json()["detail"]
+
+    assert repository.list_step_logs(task_id) == []
+    task = repository.get_task_with_steps(task_id)
+    assert task["status"] == "running"
+    assert task["steps"][0]["status"] == "pending"

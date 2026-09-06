@@ -131,6 +131,9 @@ def report_step(task_id: int, step_index: int, body: ReportBody):
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        # 例如日志 message 超长/非法类型；这类是请求数据问题，不是 500。
+        raise HTTPException(status_code=422, detail=str(exc))
 
     if outcome["ignored_duplicate"]:
         message = "duplicate failure ignored; existing success preserved"

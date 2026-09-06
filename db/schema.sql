@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     claimed_by     VARCHAR(255) NULL,
     claimed_at     DATETIME NULL,
     started_at     DATETIME NULL,
+    lease_expires_at DATETIME NULL,
     finished_at    DATETIME NULL,
     created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

@@ -73,6 +73,7 @@ def _task_summary(row: Mapping[str, Any]) -> Dict[str, Any]:
         "claimed_by": row["claimed_by"],
         "claimed_at": row["claimed_at"],
         "started_at": row["started_at"],
+        "lease_expires_at": row["lease_expires_at"],
         "finished_at": row["finished_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -239,7 +240,8 @@ def _load_task_for_update(conn: Any, task_id: int) -> Optional[Dict[str, Any]]:
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
         """
-        SELECT id, status, claimed_by, claimed_at, started_at, finished_at
+        SELECT id, status, claimed_by, claimed_at, started_at,
+               lease_expires_at, finished_at
         FROM tasks
         WHERE id = %s
         FOR UPDATE
@@ -441,7 +443,7 @@ def list_tasks() -> List[Dict[str, Any]]:
         cursor.execute(
             """
             SELECT id, status, claimed_by, claimed_at, started_at,
-                   finished_at, created_at, updated_at
+                   lease_expires_at, finished_at, created_at, updated_at
             FROM tasks
             ORDER BY created_at DESC, id DESC
             """
@@ -459,7 +461,8 @@ def get_task_with_steps(task_id: int) -> Optional[Dict[str, Any]]:
         cursor.execute(
             """
             SELECT id, status, base_params, group_override, claimed_by,
-                   claimed_at, started_at, finished_at, created_at, updated_at
+                   claimed_at, started_at, lease_expires_at,
+                   finished_at, created_at, updated_at
             FROM tasks
             WHERE id = %s
             """,
@@ -544,8 +547,16 @@ def claim_next_task(worker_id: str) -> Optional[Dict[str, Any]]:
     if task_id is None:
         return None
 
-    # 认领成功后另开连接读取完整详情
-    return get_task_with_steps(task_id)
+    # 认领成功后另开连接读取完整详情。若这一步失败（连接抖动/任务被并发删除），
+    # 主动释放回 pending，避免产生无人执行的孤儿 claimed。
+    try:
+        return get_task_with_steps(task_id)
+    except Exception:
+        try:
+            release_task(task_id, worker_id)
+        except Exception:
+            pass
+        return None
 
 
 @_retry_on_deadlock
@@ -586,6 +597,7 @@ def _release_task_tx(conn: Any, task_id: int, worker_id: str) -> bool:
             claimed_by = NULL,
             claimed_at = NULL,
             started_at = NULL,
+            lease_expires_at = NULL,
             finished_at = NULL
         WHERE id = %s
           AND claimed_by = %s
@@ -619,6 +631,7 @@ def _recover_expired_claims_tx(conn: Any, max_claimed_seconds: float) -> int:
             claimed_by = NULL,
             claimed_at = NULL,
             started_at = NULL,
+            lease_expires_at = NULL,
             finished_at = NULL
         WHERE status = 'claimed'
           AND claimed_at IS NOT NULL
@@ -629,6 +642,40 @@ def _recover_expired_claims_tx(conn: Any, max_claimed_seconds: float) -> int:
     recovered = cursor.rowcount
     conn.commit()
     return recovered
+
+
+@_retry_on_deadlock
+def _recover_expired_running_tx(conn: Any, lease_seconds: float) -> int:
+    """在单个连接内回收租约过期的 running 任务（不包含死锁重试）。"""
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE tasks
+        SET status = 'pending',
+            claimed_by = NULL,
+            claimed_at = NULL,
+            started_at = NULL,
+            lease_expires_at = NULL,
+            finished_at = NULL
+        WHERE status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < NOW() - INTERVAL %s SECOND
+        """,
+        (float(lease_seconds),),
+    )
+    recovered = cursor.rowcount
+    conn.commit()
+    return recovered
+
+
+def recover_expired_running(lease_seconds: float = 30.0) -> int:
+    """把租约过期仍未续约的 running 任务重置回 pending。
+
+    running 任务需要 worker 在 lease_seconds 内续约；超时说明 worker 可能
+    已崩溃。Steps 状态保留不动，重新执行时靠 step_logs 唯一键幂等去重。
+    遇到 MySQL 死锁自动重试最多 3 次。
+    """
+    return _recover_expired_running_tx(lease_seconds)
 
 
 def recover_expired_claims(max_claimed_seconds: float) -> int:
@@ -678,18 +725,22 @@ def _mark_task_running(
     conn: Any,
     task_id: int,
     worker_id: str,
+    *,
+    lease_seconds: float = 30.0,
 ) -> bool:
     """在已创建的连接内执行 claimed -> running（不包含死锁重试）。"""
     cursor = conn.cursor()
     cursor.execute(
         """
         UPDATE tasks
-        SET status = 'running', started_at = COALESCE(started_at, NOW())
+        SET status = 'running',
+            started_at = COALESCE(started_at, NOW()),
+            lease_expires_at = NOW() + INTERVAL %s SECOND
         WHERE id = %s
           AND status = 'claimed'
           AND claimed_by = %s
         """,
-        (task_id, worker_id),
+        (float(lease_seconds), task_id, worker_id),
     )
     success = cursor.rowcount == 1
     conn.commit()
@@ -697,18 +748,58 @@ def _mark_task_running(
 
 
 @_retry_on_deadlock
-def _mark_task_running_retryable(conn: Any, task_id: int, worker_id: str) -> bool:
+def _mark_task_running_retryable(
+    conn: Any, task_id: int, worker_id: str, lease_seconds: float
+) -> bool:
     """带死锁重试的 claimed -> running 事务函数。"""
-    return _mark_task_running(conn, task_id, worker_id)
+    return _mark_task_running(conn, task_id, worker_id, lease_seconds=lease_seconds)
 
 
-def mark_task_running(task_id: int, worker_id: str) -> bool:
-    """将任务从 claimed 推进到 running。
+def mark_task_running(
+    task_id: int,
+    worker_id: str,
+    *,
+    lease_seconds: float = 30.0,
+) -> bool:
+    """将任务从 claimed 推进到 running，并写入租约到期时间。
 
     仅当任务当前状态为 claimed 且 claimed_by == worker_id 时成功。
     遇到 MySQL 死锁自动重试最多 3 次。
     """
-    return _mark_task_running_retryable(task_id, worker_id)
+    return _mark_task_running_retryable(task_id, worker_id, lease_seconds)
+
+
+@_retry_on_deadlock
+def _renew_running_lease_tx(conn: Any, task_id: int, worker_id: str, lease_seconds: float) -> bool:
+    """在单个连接内续约 running 任务租约（不包含死锁重试）。"""
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE tasks
+        SET lease_expires_at = NOW() + INTERVAL %s SECOND
+        WHERE id = %s
+          AND status = 'running'
+          AND claimed_by = %s
+        """,
+        (float(lease_seconds), task_id, worker_id),
+    )
+    success = cursor.rowcount == 1
+    conn.commit()
+    return success
+
+
+def renew_running_lease(
+    task_id: int,
+    worker_id: str,
+    *,
+    lease_seconds: float = 30.0,
+) -> bool:
+    """仅由当前 running 任务持有者续约租约。
+
+    返回 False 表示任务已不在 running 或不属于该 worker。
+    遇到 MySQL 死锁自动重试最多 3 次。
+    """
+    return _renew_running_lease_tx(task_id, worker_id, lease_seconds)
 
 
 @_retry_on_deadlock
@@ -1070,8 +1161,33 @@ def _complete_task_atomically_tx(
         raise RuntimeError(f"task {task_id} not found")
     _require_owner(task, worker_id)
 
+    # 严格校验 results 元素/字段；不允许 int(1.5)、bool("false") 等静默转换。
+    for pos, item in enumerate(results, start=1):
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"results[{pos - 1}] must be a mapping, got {type(item).__name__}"
+            )
+        step_index = item.get("step_index")
+        if isinstance(step_index, bool) or not isinstance(step_index, int):
+            raise TypeError(
+                f"results[{pos - 1}].step_index must be an int, "
+                f"got {type(step_index).__name__}"
+            )
+        if step_index <= 0:
+            raise ValueError(
+                f"results[{pos - 1}].step_index must be a positive integer (>= 1)"
+            )
+        success = item.get("success")
+        if not isinstance(success, bool):
+            raise TypeError(
+                f"results[{pos - 1}].success must be a bool, "
+                f"got {type(success).__name__}"
+            )
+        if "message" in item:
+            _validate_log_message(item["message"])
+
     # 校验所有 step_index 都存在且没有重复；同时锁定步骤行。
-    indexes = [int(item["step_index"]) for item in results]
+    indexes = [item["step_index"] for item in results]
     if len(set(indexes)) != len(indexes):
         raise ValueError(f"duplicate step_index in results: {indexes}")
 
@@ -1114,17 +1230,33 @@ def _complete_task_atomically_tx(
 
     log_inserted = 0
     ignored_failures = 0
-    effective_results: List[Mapping[str, Any]] = []
+    steps_updated = 0
+    # 记录本事务内每个 step_index 被应用后的最终状态；成功日志是权威，
+    # 因此因“已有 success log”被忽略的 failure 也要把 Step 修复为 done。
+    final_step_statuses: Dict[int, str] = {}
+
     for item in results:
-        step_index = int(item["step_index"])
-        success = bool(item["success"])
+        step_index = item["step_index"]
+        success = item["success"]
         message = item.get("message") or ""
         step_status = "done" if success else "failed"
 
         if not success and keep_success_on_conflict:
-            # 已有成功日志时忽略本次失败结果
             if _step_has_success_log(conn, task_id, step_index):
+                # 后到 failure 不覆盖已有 success 日志；但 success log 是权威，
+                # Step 应修复为 done，保证“日志/Step 状态”自洽。不新增日志。
                 ignored_failures += 1
+                updated = _update_step_status(
+                    conn,
+                    task_id,
+                    step_index,
+                    "done",
+                    started=True,
+                    finished=True,
+                )
+                if updated:
+                    steps_updated += 1
+                final_step_statuses[step_index] = "done"
                 continue
 
         if _insert_step_log(
@@ -1133,7 +1265,7 @@ def _complete_task_atomically_tx(
             message,
         ):
             log_inserted += 1
-        _update_step_status(
+        updated = _update_step_status(
             conn,
             task_id,
             step_index,
@@ -1141,24 +1273,37 @@ def _complete_task_atomically_tx(
             started=True,
             finished=True,
         )
-        effective_results.append(item)
+        if updated:
+            steps_updated += 1
+        final_step_statuses[step_index] = step_status
 
-    any_failed = any(not bool(item["success"]) for item in effective_results)
-    if effective_results and any_failed:
+    # 基于事务内已锁定的全部 Step 的最新状态决定终态：
+    # - 存在 failed Step -> 任务 failed
+    # - 全部 done -> 任务 done
+    # - 仍有 pending/running（理论上 results 已覆盖全部 Step，不会出现）-> 保持原状态
+    cursor.execute(
+        """
+        SELECT step_index, status
+        FROM steps
+        WHERE task_id = %s
+        ORDER BY step_index
+        """,
+        (task_id,),
+    )
+    latest_rows = cursor.fetchall()
+    latest_statuses: Dict[int, str] = {}
+    for row in latest_rows:
+        idx = int(row["step_index"])
+        latest_statuses[idx] = final_step_statuses.get(idx, row["status"])
+
+    statuses = list(latest_statuses.values())
+    if "failed" in statuses:
         task_status = "failed"
         _update_task_status(conn, task_id, "failed", finished=True)
-    elif effective_results:
+    elif all(st == "done" for st in statuses):
         task_status = "done"
         _update_task_status(conn, task_id, "done", finished=True)
     else:
-        # effective_results 为空且 ignored_failures > 0：
-        # 全部失败结果都因“已有 success 日志”被忽略，不应把任务错误置为 done。
-        # 这里不修改任务状态，保留 running/claimed；调用方会收到非终态结果。
-        if ignored_failures <= 0:
-            raise RuntimeError(
-                f"complete_task_atomically task {task_id}: no effective step "
-                f"results and no ignored failures; refusing to update task"
-            )
         task_status = task["status"]
 
     conn.commit()
@@ -1166,7 +1311,7 @@ def _complete_task_atomically_tx(
         "task_id": task_id,
         "task_status": task_status,
         "log_inserted": log_inserted,
-        "steps_updated": len(effective_results),
+        "steps_updated": steps_updated,
         "ignored_failures": ignored_failures,
     }
 
@@ -1195,6 +1340,7 @@ def complete_task_atomically(
         )
     if len(results) == 0:
         raise ValueError("results must not be empty when completing a task")
+    # 元素级校验在事务体内执行，保证任何非法输入都整体回滚不产生部分写入。
 
     return _complete_task_atomically_tx(
         task_id,
