@@ -15,8 +15,6 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-logs/
-*.log
 backups/
 
 # Defense/prep internal docs (not for public repo)

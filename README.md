@@ -1,127 +1,194 @@
-# TaskKanban 任务调度看板
+- # TaskKanban 任务调度看板
 
-TaskKanban 是基于 MySQL 行锁 + 真实多进程 Worker 的轻量级任务调度系统，核心是**并发安全认领、三层参数粘性合并、Step 日志幂等写入、整任务原子提交**。
+  TaskKanban 是一个**基于 MySQL 行锁实现并发安全认领、三层参数粘性合并、执行日志幂等写入**的轻量级任务调度系统，包含 FastAPI 核心后端、真实多进程 Worker 和原生 JS 轮询看板。
 
-单人实际耗时：**约 23 小时（自 2026-09-05 14:00 起，至 2026-09-06 13:00 收尾）**。
+  自9月5日14时开始需求分析到9月6日17时基本开发完成，用时27小时
 
-## 技术栈与选型理由
+  ## 技术栈
 
-- **Python 3.10+**：标准库 multiprocessing 直接启用真实多进程 Worker。
-- **FastAPI**：API 层薄，同步业务放在 Repository 层，便于事务与测试。
-- **MySQL 8.0**：`FOR UPDATE SKIP LOCKED` + InnoDB 行锁，在 10 Worker / 5 任务/s 规模无需 Redis/MQ。
-- **原生 SQL + mysql-connector-python**：事务/锁/唯一键显式可控，不被 ORM 隐藏。
-- **原生 JS 看板**：只做轮询与并发演示，无构建链。
-- **pytest**：纯函数单测 + 真实 MySQL 集成/并发测试。
+  - Python 3.10+
+  - FastAPI + Uvicorn
+  - MySQL 8.0+（原生 SQL + mysql-connector-python）
+  - 原生 HTML + JavaScript（轮询看板）
+  - pytest
 
-## 架构
+  ## 技术栈与选型理由
 
-```text
-┌────────────┐   HTTP    ┌──────────────────┐
-│ 原生看板    │ ────────> │ FastAPI app/api   │
-│ index.html │  /tasks   │                  │
-└────────────┘           └────────┬─────────┘
-                                  │ repository.*
-┌────────────────────┐            ▼
-│ Worker 进程 N 个    │ ─────────> MySQL (InnoDB)
-│ main_loop_forever  │ 原子认领/条件更新/事务
-└────────────────────┘
-```
+  - **Python 3.10+**：标准库 `multiprocessing` 可直接启动真实多进程 Worker；开发效率高。
+  - **FastAPI**：轻量、自带 OpenAPI `/docs`；本系统业务都在 Repository 层同步读写数据库，API 层薄。
+  - **MySQL 8.0**：原生支持 `FOR UPDATE SKIP LOCKED`，能用数据库事务 + 行锁在 ≤10 Worker、≤5 任务/秒规模下安全解决并发认领，不需要引入 Redis/RabbitMQ/Kafka 等外部中间件。
+  - **SQL + mysql-connector-python**：事务边界、行锁、唯一约束都显式可控，不被 ORM 隐藏实现细节。
+  - **HTML + JavaScript**：看板只需展示状态 + 触发重复上报，不引入构建链。
+  - **pytest**：参数纯函数可单测；DB 集成测试验证真实事务与状态机。
 
-- Repository 层：SQL、事务、状态机、幂等、回收。
-- Worker 层：轮询认领、按 `step_index` 升序执行、失败即停、整任务原子提交。
-- API 层：看板查询、手动认领/开始/上报。
+  ### 并发测试
 
-## 关键语义（不可破坏）
+  Python 的 `thread` 受 GIL 限制，`asyncio` 是单线程协程级调度，二者都不是题目要求的“多个 Worker 同时访问数据库”。本项目使用真实多进程并发：
 
-1. L3 空字符串 = “不覆盖并跳过”，沿用当前生效值；L2 空字符串 = 字面值。
-2. `step_logs` 唯一键 `(task_id, step_index)`：重复上报只保留首条。
-3. 并发认领使用 `FOR UPDATE SKIP LOCKED`；任务/Step 状态只能由当前持有者推进。
-4. 死锁/锁等待（1213/40001）自动重试 3 次，覆盖认领、释放、回收、状态推进、`report_step_execution`、`complete_task_atomically`、日志写入等事务入口。
-5. `recover_claimed_interval` 是真正间隔：启动时若开启先回收一次，之后 elapsed >= 间隔才再回收；`<=0` 关闭。
-6. Worker Step 按 `step_index` 升序执行；任一步失败立即停止后续执行，并把未执行 Step 补齐为失败后原子提交，任务置 `failed`。
-7. 日志 message 写入前按 UTF-8 字节数校验不超过 MySQL TEXT 上限（65535），不做静默截断。
-8. running 任务有租约：`tasks.lease_expires_at`，Worker 每个 Step 前续约；`recover_expired_running()` 会回收租约过期的 running 任务。
+  ```text
+  multiprocessing.Process（默认 spawn）
+  → 每个子进程拥有独立 Python 解释器、独立 GIL 与独立内存
+  → 每个进程调用 repository.claim_next_task() 时都 create_connection()
+  → 多个独立 TCP 连接在同一时刻竞争 MySQL 行锁
+  ```
 
-## 快速开始
+  Windows 的 `spawn` 会重新 import 模块，因此 Worker 主体放在可导入的 `main_loop_forever()` 中，而不是写在模块顶层。
 
-```bash
-mysql -uroot -p < db/schema.sql   # 建库建表
-cp .env.example .env              # 填数据库账号
-pip install -r requirements.txt
-python scripts/create_task.py --count 5
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-python -m app.worker --worker-id worker-1
-```
+  ## 架构总览
 
-看板：认领 → 开始 → “并发幂等测试”会从任务详情读取 `claimed_by`，用 `Promise.all` 同时发 5 次上报；应只有 1 次 `inserted=true`，`step_logs` 只有 1 条。
+  ```text
+  ┌────────────┐   HTTP    ┌──────────────────┐
+  │ 原生看板    │ ────────> │ FastAPI app/api   │
+  │ index.html │  /tasks   │                  │
+  └────────────┘           └────────┬─────────┘
+                                    │ repository.*
+  ┌────────────────────┐            ▼
+  │ Worker 进程 N 个    │ ─────────> MySQL (InnoDB)
+  │ main_loop_forever  │ 原子认领/条件更新/事务
+  └────────────────────┘
+  ```
 
-测试：
+  - **API 层**：查询看板、手动认领/开始/上报演示。
+  - **Repository 层**：所有 SQL、事务、状态机约束、幂等与回收逻辑。
+  - **Worker 层**：轮询认领、按顺序执行 Step、最后整任务原子提交。
 
-```bash
-pytest -v                                   # 全量回归
-pytest tests/test_concurrent_claim.py -v    # 真实多进程并发认领
-python scripts/concurrency_demo.py --tasks 5 --workers 10 --rounds 10
-python scripts/demo_duplicate_report.py     # 幂等演示
-python scripts/audit_data.py                # 数据体检
-```
+  ## 目录结构
 
-### 并发认领演示证据
+  ```text
+  app/
+    config.py        # .env 配置读取
+    db.py            # MySQL 连接
+    params.py        # 参数合并（L1/L2/L3 粘性规则）
+    repository.py    # 数据库访问层（建任务/认领/日志/状态/原子上报）
+    executor.py      # Step 模拟执行器
+    worker.py        # Worker 进程循环
+    api.py           # FastAPI 接口
+    main.py          # 启动入口
+  db/schema.sql      # 建库建表 DDL
+  web/index.html     # 极简看板
+  scripts/create_task.py  # 造数脚本
+  tests/             # 参数/状态机/幂等/API/端到端/并发认领测试
+  ```
 
-```text
-python scripts/concurrency_demo.py --tasks 5 --workers 10 --rounds 10
-并发认领演示：每轮 5 个任务，10 个 worker 进程，跑 10 轮
-======================================================================
-round=1   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=2   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=3   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=4   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=5   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=6   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=7   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=8   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=9   tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-round=10  tasks=5 workers=10 claimed=5 unique=5 duplicates=0
-======================================================================
-总轮数 10，总重复认领次数 = 0
-结果：0 次重复认领，并发安全验证通过 [OK]
-```
+  ## 环境要求
 
-### 并发认领测试证据
+  - Python 3.10+
+  - MySQL 8.0+
+  - pip
 
-```text
-pytest tests/test_concurrent_claim.py -v
-============================= test session starts =============================
-tests/test_concurrent_claim.py::test_concurrent_claim_no_duplicate PASSED [100%]
-============================== 1 passed in 2.29s ==============================
-```
+  ## 快速开始
 
-### CI
+  ### 1. 准备数据库
 
-仓库托管在 GitHub，已配置 `.github/workflows/ci.yml`：Python 3.10 + MySQL 8.0 service，执行 `db/schema.sql` 后跑 `pytest -v`，保证多进程并发测试在 Linux runner 上可复现。
+  先启动本地 MySQL 8.0，然后用 root 执行建库建表脚本：
 
-## 边界清单
+  ```bash
+  mysql -uroot -p < db/schema.sql
+  ```
+
+  创建专用账号：
+
+  ```sql
+  CREATE USER 'taskkanban'@'localhost' IDENTIFIED BY '你的密码';
+  GRANT ALL PRIVILEGES ON taskkanban.* TO 'taskkanban'@'localhost';
+  FLUSH PRIVILEGES;
+  ```
+
+  或者修改`.env`文件，填入`root`账号与密码
+
+  复制环境变量文件：
+
+  ```bash
+  cp .env.example .env
+  ```
+
+  Windows PowerShell：
+
+  ```powershell
+  Copy-Item .env.example .env
+  ```
+
+  编辑 `.env`，填入你的数据库账号密码。
+
+  ### 2. 安装依赖
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+  ### 3. 创建演示任务
+
+  ```bash
+  python scripts/create_task.py --count 5
+  ```
+
+  ### 4. 启动 API 看板
+
+  ```bash
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
+  ```
+
+  打开 <http://0.0.0.0:8000> 查看看板。
+
+  ### 5. 启动 Worker
+
+  开一个终端启动 worker：
+
+  ```bash
+  python -m app.worker --worker-id worker-1
+  ```
+
+  一次性拉多个 Worker：
+
+  ```bash
+  python scripts/run_workers.py --workers 5 --prefix local --wait
+  ```
+
+  压力演示（5 个 Worker + 每秒 5 个随机任务）：
+
+  ```bash
+  python scripts/stress_demo.py --workers 5 --duration 10 --tasks-per-second 5
+  ```
+
+  ### 6. 看板手动演示
+
+  如果没有启动 worker，也可以在页面上手动演示状态流：
+
+  1. 任务 `pending` 时点击 **“认领”**，任务变为 `claimed`；
+  2. 点击 **“开始”**，任务变为 `running`；
+  3. 点击 **“并发幂等测试”**，对当前 Step 并发触发 5 次完成上报；
+  4. 页面弹窗会显示 5 次结果中只有第一次 `inserted=true`，其余为幂等忽略；
+  5. 上报最后一个 Step 后任务变为 `done`。
+
+  ### 7. 运行测试
+
+  ```bash
+  pytest -v
+  ```
+
+## 运行结果证据
+
+详见根目录下logs文件夹
+
+## 边界情况
+
+具体发现的问题以及修复详见根目录下`BOUNDARIES.md`
 
 ### 参数合并
-- L3 空串回退当前值，不回退 L1 base；当前值本身为空时保持空串。
-- L2 空串字面生效；`0/False/None/[]/{}` 都合法覆盖。
-- 嵌套 dict/list 整体替换；快照与输入深拷贝隔离。
-- step_index 按真实值而非数组下标，乱序/空洞安全，重复/非法报错。
 
-### 并发认领与恢复
-- 认领单事务 `FOR UPDATE SKIP LOCKED` + 条件 UPDATE，不重复、不丢任务。
-- claimed 超时回收；running 租约过期后可被 `recover_expired_running` 回收。
-- Worker 认领后未进入 running 会主动 release；读详情失败也会释放回 pending。
+- L3 空串 = “不覆盖”，沿用当前生效值；L2 空串按字面值覆盖。
+- 0 / False / None / [] / {} 都按字面覆盖，不做假值跳过。
+- 嵌套 dict/list 整体替换，不做深合并。
+- step_index 按真实序号解析，乱序/空洞安全；同一任务内必须唯一。
 
-### 状态机 / 原子上报
-- 只有持有者能推进；终态不能乱跳。
-- 整任务提交必须覆盖全部 Step；success log 是权威，存在 success log 的 Step 应修复为 done。
-- 提交终态基于事务内全部 Step 的最新状态：全部 done -> done，存在 failed -> failed，不再只依赖 effective_results。
-- `report_step_execution` 按 step_index 升序上报，不能跳过前置 Step。
-- 后到 failure 不覆盖已有 success；重复 success 只保留首条。
-- Step 失败即停：后续 Step 不再执行，但以失败日志补齐，保证 `complete_task_atomically` 提交全部 Step。
+### 并发与恢复
 
-### 看板 / API / 运维
-- 看板手动认领/开始固定使用 `manual-claim`；并发上报使用任务实际 `claimed_by`。
-- 单 Step 任务点“并发幂等测试”会提示建议使用多步任务，避免并发时产生部分 409。
-- API 超长 message 返回 422；已 done/failed 任务不能再上报。
-- API 无认证、异常仍可能返回内部信息、看板无分页、Step 为 mock、无连接池/自动归档（生产化已知限制）。
+- 认领使用 `FOR UPDATE SKIP LOCKED` + 条件 UPDATE。
+- 只有持有者可推进状态；终态不可回改。
+- running 任务有租约，Worker 每 Step 续约；过期任务可被回收。
+
+### 幂等日志
+
+- 每个 `(task_id, step_index)` 只有一条日志；后到 failure 不覆盖 success。
+- Worker 整任务原子提交；Step 失败即停，未执行 Step 以失败补齐。
+

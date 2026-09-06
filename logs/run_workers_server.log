@@ -1,0 +1,10 @@
+nohup: ignoring input
+started server-worker-1 pid=1292050
+started server-worker-2 pid=1292051
+started server-worker-3 pid=1292052
+
+3 worker(s) started. Ctrl+C to stop all.
+
+
+stopping workers...
+all workers stopped
