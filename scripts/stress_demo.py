@@ -28,6 +28,11 @@ import sys
 import time
 from pathlib import Path
 
+# Windows GBK 控制台直接打印中文会乱码，统一走 UTF-8 输出。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
