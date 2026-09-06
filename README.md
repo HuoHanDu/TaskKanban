@@ -1,6 +1,6 @@
 # TaskKanban 任务调度看板
 
-全栈方向笔试题：任务调度系统核心后端 + 极简状态看板。
+TaskKanban 是一个**基于 MySQL 行锁实现并发安全认领、三层参数粘性合并、执行日志幂等写入**的轻量级任务调度系统，包含 FastAPI 核心后端、真实多进程 Worker 和原生 JS 轮询看板。
 
 ## 技术栈
 
@@ -10,11 +10,45 @@
 - 原生 HTML + JavaScript（轮询看板）
 - pytest
 
-## 为什么选择 Python
+## 技术栈与选型理由
 
-- `multiprocessing` 可启动真实多进程 worker，符合题目“真实并发测试”要求。
-- 开发效率高，适合 2 天完成核心功能。
-- FastAPI 轻量，自带 `/docs`，便于联调。
+- **Python 3.10+**：标准库 `multiprocessing` 可直接启动真实多进程 Worker；开发效率高。
+- **FastAPI**：轻量、自带 OpenAPI `/docs`；本系统业务都在 Repository 层同步读写数据库，API 层薄。
+- **MySQL 8.0**：原生支持 `FOR UPDATE SKIP LOCKED`，能用数据库事务 + 行锁在 ≤10 Worker、≤5 任务/秒规模下安全解决并发认领，不需要引入 Redis/RabbitMQ/Kafka 等外部中间件。
+- **SQL + mysql-connector-python**：事务边界、行锁、唯一约束都显式可控，不被 ORM 隐藏实现细节。
+- **HTML + JavaScript**：看板只需展示状态 + 触发重复上报，不引入构建链。
+- **pytest**：参数纯函数可单测；DB 集成测试验证真实事务与状态机。
+
+### 并发测试
+
+Python 的 `thread` 受 GIL 限制，`asyncio` 是单线程协程级调度，二者都不是题目要求的“多个 Worker 同时访问数据库”。本项目使用真实多进程并发：
+
+```text
+multiprocessing.Process（默认 spawn）
+→ 每个子进程拥有独立 Python 解释器、独立 GIL 与独立内存
+→ 每个进程调用 repository.claim_next_task() 时都 create_connection()
+→ 多个独立 TCP 连接在同一时刻竞争 MySQL 行锁
+```
+
+Windows 的 `spawn` 会重新 import 模块，因此 Worker 主体放在可导入的 `main_loop_forever()` 中，而不是写在模块顶层。
+
+## 架构总览
+
+```text
+┌────────────┐   HTTP    ┌──────────────────┐
+│ 原生看板    │ ────────> │ FastAPI app/api   │
+│ index.html │  /tasks   │                  │
+└────────────┘           └────────┬─────────┘
+                                  │ repository.*
+┌────────────────────┐            ▼
+│ Worker 进程 N 个    │ ─────────> MySQL (InnoDB)
+│ main_loop_forever  │ 原子认领/条件更新/事务
+└────────────────────┘
+```
+
+- **API 层**：查询看板、手动认领/开始/上报演示。
+- **Repository 层**：所有 SQL、事务、状态机约束、幂等与回收逻辑。
+- **Worker 层**：轮询认领、按顺序执行 Step、最后整任务原子提交。
 
 ## 目录结构
 
@@ -37,7 +71,7 @@ tests/             # 参数/状态机/幂等/API/端到端/并发认领测试
 ## 环境要求
 
 - Python 3.10+
-- MySQL 8.0+（需要支持 `FOR UPDATE SKIP LOCKED`）
+- MySQL 8.0+
 - pip
 
 ## 快速开始
@@ -50,13 +84,15 @@ tests/             # 参数/状态机/幂等/API/端到端/并发认领测试
 mysql -uroot -p < db/schema.sql
 ```
 
-创建专用账号（或直接使用 root，自行调整）：
+创建专用账号：
 
 ```sql
 CREATE USER 'taskkanban'@'localhost' IDENTIFIED BY '你的密码';
 GRANT ALL PRIVILEGES ON taskkanban.* TO 'taskkanban'@'localhost';
 FLUSH PRIVILEGES;
 ```
+
+或者修改`.env`文件，填入`root`账号与密码
 
 复制环境变量文件：
 
@@ -90,7 +126,7 @@ python scripts/create_task.py --count 5
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-打开 <http://127.0.0.1:8000> 查看看板。
+打开 <http://0.0.0.0:8000> 查看看板。
 
 ### 5. 启动 Worker
 
@@ -100,18 +136,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python -m app.worker --worker-id worker-1
 ```
 
-可另开终端启动多个：
+一次性拉多个 Worker：
 
 ```bash
-python -m app.worker --worker-id worker-2
+python scripts/run_workers.py --workers 5 --prefix local --wait
 ```
 
-Worker 默认会：
+压力演示（5 个 Worker + 每秒 5 个随机任务）：
 
-- 轮询并原子认领 pending 任务；
-- 执行任务的全部 Step；
-- 一次性原子提交日志 + Step 状态 + 任务状态；
-- 定期回收超过租约仍未进入 running 的 claimed 任务。
+```bash
+python scripts/stress_demo.py --workers 5 --duration 10 --tasks-per-second 5
+```
 
 ### 6. 看板手动演示
 
@@ -129,135 +164,44 @@ Worker 默认会：
 pytest -v
 ```
 
-## 核心设计
 
-### 参数合并（L1/L2/L3）
 
-- L1 base 是任务默认参数。
-- L2 group override 在任务开始时一次性合并，空字符串按字面值处理。
-- L3 step override 有粘性：从声明 key 的 Step 开始持续生效。
-- L3 空字符串表示“本 Step 不覆盖此 key”，沿用当前值。
+## 边界情况
 
-代码位于 `app/params.py`，是纯函数模块。
+### 参数合并
 
-### 并发认领
+1. L3 空字符串表示“不覆盖”，回退到当前生效值而不是 L1 base
+2. L2 空字符串按字面值处理，与 L3 空串语义不同
+3. 当前值本身是空字符串时，L3 再给空串仍保持空串
+4. `0 / False / None / [] / {}` 都是合法覆盖值，不能因假值被跳过
+5. override 可引入 base 中不存在的新 key，且粘性持续
+6. 嵌套 dict/list 是整体替换，不做嵌套深合并
+7. 快照/返回值与输入深度隔离，修改快照不污染输入
+8. step_index 允许乱序/空洞，按真实序号而非数组下标处理
+9. step_index 必须正整数且任务内唯一，bool/0/负数/重复会报错
+10. L3 无法表达“显式覆盖成空字符串”和“删除某个 key”（设计限制）
 
-使用 MySQL 行锁 + 原子更新：
+### 并发认领与恢复
 
-```sql
-SELECT id FROM tasks
-WHERE status = 'pending'
-ORDER BY created_at, id
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-```
+1. 认领是单事务 `FOR UPDATE SKIP LOCKED` + 条件 UPDATE，不会重复认领
+2. `claimed` 任务超时后可回收；`running` 中 Worker 崩溃仍需心跳/租约续期（已知限制）
+3. Worker 认领后未成功进入 running 会主动 release，避免孤儿 claimed
+4. 死锁 1213 会自动重试 3 次
 
-同一任务只能被一个 worker 认领。
+### 状态机 / 原子上报
 
-测试方式：`multiprocessing` 启动 10 个进程同时认领 5 个 pending 任务，断言无重复认领。
+1. 只有当前持有者能推进状态；pending/done/failed 不能乱跳
+2. 任务终态与 Step 明细的一致性由 `complete_task_atomically`/`report_step_execution` 保证，不能直接调用低层状态函数绕过
+3. `complete_task_atomically` 必须提交任务全部 Step，部分结果会被拒绝
+4. `report_step_execution` 必须按 step_index 顺序上报，不能跳过前置 Step
+5. 后到 failure 不会覆盖已有 success
+6. 重复 success 只保留第一条日志，message 不更新
+7. 失败后不支持同一执行周期内“失败重试成功”（需要新执行周期）
 
-### 状态机与持有权约束
+### 看板 / API / 运维
 
-所有状态推进函数都使用条件更新，并返回 `bool`：
-
-- `claim`: `pending -> claimed`，同一任务只能被一个 worker 认领；
-- `mark_task_running(worker_id)`: 仅 `claimed_by == worker_id` 且状态为 `claimed` 时成功；
-- `mark_task_done/failed(worker_id)`: 仅当前持有者且状态为 `claimed/running` 时成功；
-- `mark_step_status(worker_id)`: 仅任务由该 worker 持有且处于 `claimed/running` 时成功；
-- `release_task(task_id, worker_id)`: 持有者主动释放，回到 `pending`；
-- `recover_expired_claims(max_claimed_seconds)`: 回收超过租约时间仍未进入 `running` 的 `claimed` 任务。
-
-合法状态流转：
-
-```text
-pending --claim--> claimed --running--> running --done--> done
-                                \
-                                 \--failed--> failed
-```
-
-非法流转会被条件更新拒绝并返回 `False`：
-
-```text
-pending 直接 -> running/done/failed      拒绝
-claimed 被非持有者 -> running/done/failed 拒绝
-done -> failed/running/claimed           拒绝
-failed -> running/done                   拒绝
-```
-
-### 原子 Step 上报 / 整任务原子提交
-
-`report_step_execution()` 在单个事务内完成：
-
-```text
-Step 日志 + Step 状态 + 任务终态
-```
-
-`complete_task_atomically()` 让 worker 先执行完所有 Step，再一次性提交：
-
-```text
-全部日志 + 全部 Step 状态 + 任务 done/failed
-```
-
-已成功 Step 如果之后收到重复的 failure 上报，默认忽略该失败，不会覆盖已有成功记录。
-
-### 幂等日志
-
-`step_logs` 表对 `(task_id, step_index)` 建唯一索引。
-
-写入使用：
-
-```sql
-INSERT IGNORE INTO step_logs (task_id, step_index, status, message)
-VALUES (...)
-```
-
-重复上报不会覆盖已有记录。
-
-## API
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/tasks` | 任务列表 |
-| GET | `/tasks/{id}` | 任务详情（含 steps） |
-| POST | `/tasks/{id}/claim` | 手动认领演示 |
-| POST | `/tasks/{id}/start` | 手动开始执行（claimed -> running，看板演示用） |
-| POST | `/tasks/{id}/steps/{n}/report` | 重复完成上报（幂等演示） |
-
-### Worker 参数
-
-```bash
-python -m app.worker --worker-id worker-1 \
-  --claim-lease-seconds 300 \
-  --recover-claimed-interval 30
-```
-
-- `--claim-lease-seconds`：claimed 任务超过该秒数未进入 running 则允许回收；
-- `--recover-claimed-interval`：worker 每次循环前执行过期 claimed 回收；`<=0` 关闭。
-
-## 测试证据
-
-在完整环境（本机 MySQL + 可运行 multiprocessing）下执行 `pytest -v`，覆盖：
-
-```text
-tests/test_params.py            65 passed   # 参数合并 L1/L2/L3 组合与边界
-tests/test_state_machine.py     20 passed   # 状态机合法/非法流转/持有权/回收
-tests/test_idempotent_log.py     2 passed   # 幂等日志重复写入
-tests/test_atomic_report.py     12 passed   # 原子 Step 上报/整任务原子提交
-tests/test_api.py               15 passed   # API 查询/认领/上报/权限
-tests/test_api_start.py          4 passed   # API 手动 start 演示路径
-tests/test_e2e_flow.py           5 passed   # 端到端完整链路
-tests/test_concurrent_claim.py   1 passed   # 真实多进程并发认领无重复
-------------------------------------------------
-合计 124 passed
-```
-
-> 若在受限沙箱/CI 中无法创建 multiprocessing 管道，`test_concurrent_claim.py` 可能无法运行；
-> 其余 123 个用例应全部通过。并发认领测试需要在可运行 `multiprocessing` 的本机环境执行。
-
-## 已知限制
-
-- Worker 的 Step 执行是 mock，不真正发送消息。
-- 未做用户认证（本地/笔试场景不需要）。
-- 未做 WebSocket，看板使用 2 秒轮询。
-- 超时回收只回收长期停留在 `claimed` 的任务；`running` 中 worker 真实崩溃仍需心跳/租约续期机制，当前属于简化方案。
-- 异常处理器会把内部错误字符串返回给客户端，仅适合本地笔试场景。
+1. 看板固定 `manual-claim` 所有权链路
+2. 任务已 done/failed 后不能再上报
+3. API 无认证、异常返回内部信息、看板无分页（生产化已知限制）
+4. Step 执行是 mock，不真实发送消息
+5. 无连接池；无自动清理/归档；审计脚本只读不自动修复
