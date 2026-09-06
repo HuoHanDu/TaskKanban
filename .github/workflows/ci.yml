@@ -35,14 +35,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Initialize schema
-        run: mysql -h 127.0.0.1 -uroot -proot < db/schema.sql
+      - name: Initialize schema and test user
+        run: |
+          mysql -h 127.0.0.1 -uroot -proot < db/schema.sql
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE USER IF NOT EXISTS 'taskkanban'@'%' IDENTIFIED BY 'taskkanban';
+            GRANT ALL PRIVILEGES ON taskkanban.* TO 'taskkanban'@'%';
+            FLUSH PRIVILEGES;
+          "
 
       - name: Run full test suite
         env:
           MYSQL_HOST: 127.0.0.1
           MYSQL_PORT: 3306
-          MYSQL_USER: root
-          MYSQL_PASSWORD: root
+          MYSQL_USER: taskkanban
+          MYSQL_PASSWORD: taskkanban
           MYSQL_DATABASE: taskkanban
         run: pytest -v
